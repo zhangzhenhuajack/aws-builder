@@ -1,0 +1,82 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS Bedrock IAM Policy for LiteLLM ECS Task Role.
+  Provides least-privilege permissions to invoke Bedrock models via IAM Role.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: litellm
+    Description: Environment name prefix
+
+Resources:
+  #============================================================
+  # IAM Managed Policy for Bedrock Model Invocation
+  #============================================================
+  BedrockInvokePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${EnvironmentName}-bedrock-invoke-policy
+      Description: !Sub "Policy for ${EnvironmentName} ECS tasks to invoke Bedrock models via IAM Role"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: BedrockModelInvoke
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource:
+              # Claude Opus 4.6
+              - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-opus-4-6-v1"
+              - "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-4-6-v1"
+              - "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-opus-4-6-v1"
+              # Claude Opus 4.7
+              - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-opus-4-7"
+              - "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-4-7"
+              - "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-opus-4-7"
+              # Claude Sonnet 4
+              - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-sonnet-4-20250514"
+              - "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-20250514"
+              - "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-sonnet-4-20250514"
+          - Sid: BedrockCrossRegionInvoke
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource:
+              - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.*"
+              - !Sub "arn:aws:bedrock:us-east-1:${AWS::AccountId}:inference-profile/us.anthropic.*"
+              - !Sub "arn:aws:bedrock:us-west-2:${AWS::AccountId}:inference-profile/us.anthropic.*"
+          - Sid: BedrockListModels
+            Effect: Allow
+            Action:
+              - bedrock:ListFoundationModels
+              - bedrock:GetFoundationModel
+            Resource: '*'
+
+#============================================================
+# Outputs
+#============================================================
+Outputs:
+  BedrockInvokePolicyArn:
+    Description: IAM Managed Policy ARN for Bedrock model invocation (attached to ECS Task Role)
+    Value: !Ref BedrockInvokePolicy
+    Export:
+      Name: !Sub ${EnvironmentName}-BedrockInvokePolicyArn
+
+  BedrockInvokePolicyName:
+    Description: IAM Managed Policy name
+    Value: !Sub ${EnvironmentName}-bedrock-invoke-policy
+
+  AuthMethod:
+    Description: Authentication method used for Bedrock access
+    Value: "IAM Role (attached to ECS Task Role via ManagedPolicyArns)"
+
+  SupportedModels:
+    Description: Bedrock models allowed by this policy
+    Value: "anthropic.claude-opus-4-6-v1, anthropic.claude-opus-4-7, anthropic.claude-sonnet-4-20250514"
+
+  HowItWorks:
+    Description: How Bedrock auth works with ECS
+    Value: "ECS Task Role has this policy attached. LiteLLM auto-detects IAM credentials from the task metadata endpoint. No API keys needed."

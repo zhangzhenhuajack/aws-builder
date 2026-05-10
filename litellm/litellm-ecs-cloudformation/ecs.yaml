@@ -1,0 +1,513 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  LiteLLM ECS Fargate Service with Internal ALB, Secrets Manager,
+  IAM Role-based Bedrock access, config on S3, security best practices.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: litellm
+    Description: Environment name (must match other stacks)
+
+  LiteLLMImage:
+    Type: String
+    Default: ghcr.io/berriai/litellm:1.84.0-dev.2
+    Description: LiteLLM Docker image
+
+  TaskCpu:
+    Type: Number
+    Default: 2048
+    Description: Task CPU units (1024 = 1 vCPU)
+
+  TaskMemory:
+    Type: Number
+    Default: 4096
+    Description: Task memory in MB
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    Description: Desired number of ECS tasks
+
+  SearxngApiBase:
+    Type: String
+    Default: ''
+    Description: SearXNG API base URL (optional, leave empty to disable)
+
+  ContainerPort:
+    Type: Number
+    Default: 4000
+    Description: Container port for LiteLLM
+
+Resources:
+  #============================================================
+  # Secrets Manager - LiteLLM Master Key
+  #============================================================
+  MasterKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${EnvironmentName}/litellm/master-key
+      Description: LiteLLM Master Key for admin access
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: LITELLM_MASTER_KEY
+        PasswordLength: 40
+        ExcludeCharacters: '"@/\'''
+        IncludeSpace: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-master-key
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  #============================================================
+  # ECS Cluster
+  #============================================================
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${EnvironmentName}-ecs-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: DEFAULT
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ecs-cluster
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  #============================================================
+  # IAM Roles
+  #============================================================
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref MasterKeySecret
+                  - Fn::ImportValue: !Sub ${EnvironmentName}-AuroraSecretArn
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Bedrock access via IAM Role (from bedrock.yaml stack)
+        - Fn::ImportValue: !Sub ${EnvironmentName}-BedrockInvokePolicyArn
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${BucketName}/config/*"
+                    - BucketName:
+                        Fn::ImportValue: !Sub ${EnvironmentName}-S3BucketName
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${BucketName}/litellm-logs/*"
+                    - BucketName:
+                        Fn::ImportValue: !Sub ${EnvironmentName}-S3BucketName
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${BucketName}"
+                    - BucketName:
+                        Fn::ImportValue: !Sub ${EnvironmentName}-S3BucketName
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - Fn::ImportValue: !Sub ${EnvironmentName}-DynamoDBTableArn
+                  - !Sub
+                    - "${TableArn}/index/*"
+                    - TableArn:
+                        Fn::ImportValue: !Sub ${EnvironmentName}-DynamoDBTableArn
+
+  #============================================================
+  # Security Groups
+  #============================================================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for internal ALB (CloudFront VPC origin)
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp:
+            Fn::ImportValue: !Sub ${EnvironmentName}-VpcCIDR
+          Description: Allow HTTP from within VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-alb-sg
+
+  # NOTE: After deploying cloudfront-waf.yaml, run this to allow CloudFront VPC Origin:
+  #   CF_SG=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=CloudFront-VPCOrigins-Service-SG" --query "SecurityGroups[0].GroupId" --output text)
+  #   ALB_SG=$(aws cloudformation describe-stacks --stack-name litellm-ecs --query "Stacks[0].Outputs[?OutputKey=='ALBSecurityGroupId'].OutputValue" --output text)
+  #   aws ec2 authorize-security-group-ingress --group-id $ALB_SG --protocol tcp --port 80 --source-group $CF_SG
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ECS tasks
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Allow traffic from ALB only
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ecs-sg
+
+  #============================================================
+  # Application Load Balancer (Internal)
+  #============================================================
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${EnvironmentName}-int-alb
+      Type: application
+      Scheme: internal
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet1Id
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet2Id
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '120'
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-int-alb
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-ecs-tg
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VpcId
+      TargetType: ip
+      HealthCheckPath: /health/liveliness
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '60'
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  #============================================================
+  # CloudWatch Log Group
+  #============================================================
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${EnvironmentName}/litellm
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-litellm-logs
+
+  #============================================================
+  # ECS Task Definition
+  #============================================================
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${EnvironmentName}-litellm
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        # Init container: download config from S3
+        - Name: config-init
+          Image: amazon/aws-cli:latest
+          Essential: false
+          Command:
+            - "s3"
+            - "cp"
+            - !Sub
+              - "s3://${BucketName}/config/litellm_config.yaml"
+              - BucketName:
+                  Fn::ImportValue: !Sub ${EnvironmentName}-S3BucketName
+            - "/config/litellm_config.yaml"
+          MountPoints:
+            - SourceVolume: config-volume
+              ContainerPath: /config
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: config-init
+
+        # Main container: LiteLLM (IAM Role auth for Bedrock)
+        - Name: litellm
+          Image: !Ref LiteLLMImage
+          Essential: true
+          DependsOn:
+            - ContainerName: config-init
+              Condition: SUCCESS
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          EntryPoint:
+            - "/bin/sh"
+            - "-c"
+          Command:
+            - !Join
+              - ""
+              - - "export DATABASE_URL=$(python3 -c 'import urllib.parse,os;u=urllib.parse.quote(os.environ[\"DB_USERNAME\"],safe=\"\");p=urllib.parse.quote(os.environ[\"DB_PASSWORD\"],safe=\"\");print(f\"postgresql://{u}:{p}@"
+                - Fn::ImportValue: !Sub ${EnvironmentName}-AuroraEndpoint
+                - ":5432/litellm\")') && exec litellm --config /config/litellm_config.yaml"
+          MountPoints:
+            - SourceVolume: config-volume
+              ContainerPath: /config
+          Environment:
+            - Name: SEARXNG_API_BASE
+              Value: !Ref SearxngApiBase
+            - Name: REDIS_HOST
+              Value:
+                Fn::ImportValue: !Sub ${EnvironmentName}-RedisEndpoint
+            - Name: REDIS_PORT
+              Value:
+                Fn::ImportValue: !Sub ${EnvironmentName}-RedisPort
+            - Name: S3_BUCKET_NAME
+              Value:
+                Fn::ImportValue: !Sub ${EnvironmentName}-S3BucketName
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+          Secrets:
+            - Name: LITELLM_MASTER_KEY
+              ValueFrom: !Sub "${MasterKeySecret}:LITELLM_MASTER_KEY::"
+            - Name: DB_USERNAME
+              ValueFrom: !Sub
+                - "${SecretArn}:username::"
+                - SecretArn:
+                    Fn::ImportValue: !Sub ${EnvironmentName}-AuroraSecretArn
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - "${SecretArn}:password::"
+                - SecretArn:
+                    Fn::ImportValue: !Sub ${EnvironmentName}-AuroraSecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: litellm
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:4000/health/liveliness\")' || exit 1"
+            Interval: 30
+            Timeout: 10
+            Retries: 5
+            StartPeriod: 120
+      Volumes:
+        - Name: config-volume
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-litellm-task
+
+  #============================================================
+  # ECS Service
+  #============================================================
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub ${EnvironmentName}-litellm-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 300
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+          Subnets:
+            - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet1Id
+            - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet2Id
+      LoadBalancers:
+        - ContainerName: litellm
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref ALBTargetGroup
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-litellm-service
+
+  #============================================================
+  # Auto Scaling
+  #============================================================
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 10
+      MinCapacity: !Ref DesiredCount
+      ResourceId: !Sub service/${ECSCluster}/${ECSService.Name}
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ScalingPolicyCPU:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${EnvironmentName}-cpu-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 70
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  ScalingPolicyMemory:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${EnvironmentName}-memory-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization
+        TargetValue: 80
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+#============================================================
+# Outputs
+#============================================================
+Outputs:
+  ClusterName:
+    Description: ECS Cluster name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${EnvironmentName}-ECSClusterName
+
+  ServiceName:
+    Description: ECS Service name
+    Value: !GetAtt ECSService.Name
+
+  ALBDnsName:
+    Description: Internal ALB DNS name
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub ${EnvironmentName}-ALBDnsName
+
+  ALBArn:
+    Description: Internal ALB ARN (for CloudFront VPC origin)
+    Value: !Ref ALB
+    Export:
+      Name: !Sub ${EnvironmentName}-ALBArn
+
+  ALBSecurityGroupId:
+    Description: ALB Security Group ID (add CloudFront VPC Origin SG after deploying cloudfront-waf.yaml)
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-ALBSecurityGroupId
+
+  ALBUrl:
+    Description: LiteLLM internal URL
+    Value: !Sub "http://${ALB.DNSName}"
+
+  MasterKeySecretArn:
+    Description: Secrets Manager ARN for LiteLLM Master Key (auto-generated)
+    Value: !Ref MasterKeySecret
+
+  HowToGetMasterKey:
+    Description: Command to retrieve the auto-generated LiteLLM Master Key
+    Value: !Sub
+      - "aws secretsmanager get-secret-value --secret-id ${SecretId} --query SecretString --output text | jq -r .LITELLM_MASTER_KEY"
+      - SecretId: !Ref MasterKeySecret
+
+  ConfigUploadCommand:
+    Description: Command to upload litellm config to S3
+    Value: !Sub
+      - "aws s3 cp litellm_config.yaml s3://${BucketName}/config/litellm_config.yaml"
+      - BucketName:
+          Fn::ImportValue: !Sub ${EnvironmentName}-S3BucketName
+
+  PostDeployCloudFrontSG:
+    Description: >
+      After deploying cloudfront-waf.yaml, run this to allow CloudFront VPC Origin access to ALB
+    Value: !Sub
+      - "aws ec2 authorize-security-group-ingress --group-id ${ALBSg} --protocol tcp --port 80 --source-group $(aws ec2 describe-security-groups --filters Name=group-name,Values=CloudFront-VPCOrigins-Service-SG --query SecurityGroups[0].GroupId --output text --region ${AWS::Region}) --region ${AWS::Region}"
+      - ALBSg: !Ref ALBSecurityGroup

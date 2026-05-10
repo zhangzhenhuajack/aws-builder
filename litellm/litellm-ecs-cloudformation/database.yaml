@@ -1,0 +1,357 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Aurora PostgreSQL 16 Serverless v2 + ElastiCache Redis 7.2 Serverless
+  for LiteLLM ECS deployment. Password managed by AWS Secrets Manager.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: litellm
+    Description: Environment name (must match VPC stack)
+
+  VpcStackName:
+    Type: String
+    Default: litellm-vpc
+    Description: Name of the VPC CloudFormation stack to import values from
+
+  DBName:
+    Type: String
+    Default: litellm
+    Description: Database name
+
+  DBMasterUsername:
+    Type: String
+    Default: litellm_admin
+    Description: Master username for Aurora PostgreSQL
+
+  AuroraMinACU:
+    Type: Number
+    Default: 0.5
+    Description: Aurora Serverless v2 minimum ACU
+
+  AuroraMaxACU:
+    Type: Number
+    Default: 8
+    Description: Aurora Serverless v2 maximum ACU
+
+  RedisMaxMemory:
+    Type: Number
+    Default: 5
+    Description: ElastiCache Redis Serverless max data storage in GB
+
+  RedisMaxECPU:
+    Type: Number
+    Default: 15000
+    Description: ElastiCache Redis Serverless max ECPU per second
+
+Resources:
+  #============================================================
+  # Secrets Manager - Aurora Master Password
+  #============================================================
+  AuroraSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${EnvironmentName}/aurora/master-password
+      Description: !Sub "Master credentials for ${EnvironmentName} Aurora PostgreSQL cluster"
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${DBMasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-aurora-secret
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Attach secret to Aurora cluster for automatic rotation support
+  AuroraSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref AuroraSecret
+      TargetId: !Ref AuroraCluster
+      TargetType: AWS::RDS::DBCluster
+
+  #============================================================
+  # Security Groups
+  #============================================================
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Aurora PostgreSQL Serverless v2
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp:
+            Fn::ImportValue: !Sub ${EnvironmentName}-VpcCIDR
+          Description: Allow PostgreSQL access from within VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-aurora-sg
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ElastiCache Redis Serverless
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          CidrIp:
+            Fn::ImportValue: !Sub ${EnvironmentName}-VpcCIDR
+          Description: Allow Redis access from within VPC
+        - IpProtocol: tcp
+          FromPort: 6380
+          ToPort: 6380
+          CidrIp:
+            Fn::ImportValue: !Sub ${EnvironmentName}-VpcCIDR
+          Description: Allow Redis TLS access from within VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-redis-sg
+
+  #============================================================
+  # Aurora PostgreSQL Serverless v2
+  #============================================================
+  AuroraSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Aurora PostgreSQL in private subnets
+      SubnetIds:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet1Id
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet2Id
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-aurora-subnet-group
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub ${EnvironmentName}-aurora-cluster
+      Engine: aurora-postgresql
+      EngineVersion: '16.6'
+      DatabaseName: !Ref DBName
+      MasterUsername: !Sub '{{resolve:secretsmanager:${AuroraSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${AuroraSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref AuroraSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref AuroraSecurityGroup
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref AuroraMinACU
+        MaxCapacity: !Ref AuroraMaxACU
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      DeletionProtection: true
+      EnableHttpEndpoint: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-aurora-cluster
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  AuroraInstance1:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub ${EnvironmentName}-aurora-instance-1
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-aurora-instance-1
+
+  AuroraInstance2:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub ${EnvironmentName}-aurora-instance-2
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-aurora-instance-2
+
+  #============================================================
+  # ElastiCache Redis Serverless
+  #============================================================
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !Sub ${EnvironmentName}-redis-subnet-group
+      Description: Subnet group for Redis Serverless in private subnets
+      SubnetIds:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet1Id
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet2Id
+
+  RedisServerless:
+    Type: AWS::ElastiCache::ServerlessCache
+    Properties:
+      ServerlessCacheName: !Sub ${EnvironmentName}-redis
+      Engine: redis
+      MajorEngineVersion: '7'
+      SecurityGroupIds:
+        - !Ref RedisSecurityGroup
+      SubnetIds:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet1Id
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet2Id
+      CacheUsageLimits:
+        DataStorage:
+          Maximum: !Ref RedisMaxMemory
+          Unit: GB
+        ECPUPerSecond:
+          Maximum: !Ref RedisMaxECPU
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-redis
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  #============================================================
+  # DynamoDB Serverless (On-Demand / PAY_PER_REQUEST)
+  #============================================================
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub ${EnvironmentName}-litellm-sessions
+      BillingMode: PAY_PER_REQUEST
+      TableClass: STANDARD
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: gsi1sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: gsi1sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      DeletionProtectionEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-litellm-sessions
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+#============================================================
+# Outputs
+#============================================================
+Outputs:
+  AuroraSecretArn:
+    Description: Secrets Manager ARN for Aurora credentials
+    Value: !Ref AuroraSecret
+    Export:
+      Name: !Sub ${EnvironmentName}-AuroraSecretArn
+
+  AuroraSecretName:
+    Description: Secrets Manager name for Aurora credentials
+    Value: !Sub ${EnvironmentName}/aurora/master-password
+
+  HowToGetPassword:
+    Description: >
+      Run this AWS CLI command to retrieve the database password:
+      aws secretsmanager get-secret-value --secret-id <AuroraSecretArn> --query SecretString --output text | jq -r .password
+    Value: !Sub
+      - "aws secretsmanager get-secret-value --secret-id ${SecretArn} --query SecretString --output text | jq -r .password"
+      - SecretArn: !Ref AuroraSecret
+
+  AuroraClusterEndpoint:
+    Description: Aurora PostgreSQL cluster writer endpoint
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub ${EnvironmentName}-AuroraEndpoint
+
+  AuroraClusterReaderEndpoint:
+    Description: Aurora PostgreSQL cluster reader endpoint
+    Value: !GetAtt AuroraCluster.ReadEndpoint.Address
+    Export:
+      Name: !Sub ${EnvironmentName}-AuroraReaderEndpoint
+
+  AuroraClusterPort:
+    Description: Aurora PostgreSQL port
+    Value: !GetAtt AuroraCluster.Endpoint.Port
+    Export:
+      Name: !Sub ${EnvironmentName}-AuroraPort
+
+  AuroraConnectionStringTemplate:
+    Description: >
+      PostgreSQL connection string template.
+      Retrieve actual password from Secrets Manager.
+    Value: !Sub
+      - "postgresql://${DBMasterUsername}@${Endpoint}:${Port}/${DBName}"
+      - Endpoint: !GetAtt AuroraCluster.Endpoint.Address
+        Port: !GetAtt AuroraCluster.Endpoint.Port
+
+  RedisEndpoint:
+    Description: Redis Serverless endpoint
+    Value: !GetAtt RedisServerless.Endpoint.Address
+    Export:
+      Name: !Sub ${EnvironmentName}-RedisEndpoint
+
+  RedisPort:
+    Description: Redis Serverless port
+    Value: !GetAtt RedisServerless.Endpoint.Port
+    Export:
+      Name: !Sub ${EnvironmentName}-RedisPort
+
+  RedisConnectionString:
+    Description: Redis connection string (TLS enabled)
+    Value: !Sub
+      - "rediss://${Endpoint}:${Port}"
+      - Endpoint: !GetAtt RedisServerless.Endpoint.Address
+        Port: !GetAtt RedisServerless.Endpoint.Port
+
+  AuroraSecurityGroupId:
+    Description: Aurora security group ID
+    Value: !Ref AuroraSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-AuroraSGId
+
+  RedisSecurityGroupId:
+    Description: Redis security group ID
+    Value: !Ref RedisSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-RedisSGId
+
+  DynamoDBTableName:
+    Description: DynamoDB table name
+    Value: !Ref DynamoDBTable
+    Export:
+      Name: !Sub ${EnvironmentName}-DynamoDBTableName
+
+  DynamoDBTableArn:
+    Description: DynamoDB table ARN
+    Value: !GetAtt DynamoDBTable.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-DynamoDBTableArn

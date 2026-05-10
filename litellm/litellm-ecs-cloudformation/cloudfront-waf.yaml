@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFront distribution with WAF protection, using VPC Origin
+  to route traffic to the internal ALB via private network.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: litellm
+    Description: Environment name (must match other stacks)
+
+  DomainName:
+    Type: String
+    Default: ''
+    Description: Custom domain name (optional, leave empty to use CloudFront default domain)
+
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM Certificate ARN for custom domain (required if DomainName is set, must be in us-east-1)
+
+  RateLimitPerIP:
+    Type: Number
+    Default: 2000
+    Description: Maximum requests per 5-minute window per IP address
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref DomainName, '']]
+
+Resources:
+  #============================================================
+  # WAF Web ACL
+  #============================================================
+  WAFWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub ${EnvironmentName}-waf
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      Description: !Sub "WAF for ${EnvironmentName} LiteLLM CloudFront distribution"
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${EnvironmentName}-waf-metrics
+      Rules:
+        # Rule 1: AWS Managed Common Rule Set
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${EnvironmentName}-common-rules
+
+        # Rule 2: AWS Managed Known Bad Inputs
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${EnvironmentName}-bad-inputs
+
+        # Rule 3: AWS Managed SQL Injection
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${EnvironmentName}-sqli-rules
+
+        # Rule 4: Rate Limiting per IP
+        - Name: RateLimitPerIP
+          Priority: 4
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitPerIP
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${EnvironmentName}-rate-limit
+
+        # Rule 5: AWS Managed IP Reputation List
+        - Name: AWSManagedRulesAmazonIpReputationList
+          Priority: 5
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${EnvironmentName}-ip-reputation
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-waf
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  #============================================================
+  # CloudFront VPC Origin (connects to internal ALB)
+  #============================================================
+  CloudFrontVpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    Properties:
+      VpcOriginEndpointConfig:
+        Name: !Sub ${EnvironmentName}-vpc-origin
+        Arn:
+          Fn::ImportValue: !Sub ${EnvironmentName}-ALBArn
+        HTTPPort: 80
+        HTTPSPort: 443
+        OriginProtocolPolicy: http-only
+        OriginSSLProtocols:
+          - TLSv1.2
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc-origin
+
+  #============================================================
+  # CloudFront Distribution
+  #============================================================
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${EnvironmentName} LiteLLM API Gateway"
+        HttpVersion: http2and3
+        PriceClass: PriceClass_All
+        WebACLId: !GetAtt WAFWebACL.Arn
+
+        # Custom domain (optional)
+        Aliases: !If
+          - HasCustomDomain
+          - - !Ref DomainName
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+
+        # Origin - Internal ALB via VPC Origin
+        Origins:
+          - Id: !Sub ${EnvironmentName}-alb-origin
+            DomainName:
+              Fn::ImportValue: !Sub ${EnvironmentName}-ALBDnsName
+            VpcOriginConfig:
+              VpcOriginId: !GetAtt CloudFrontVpcOrigin.Id
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 5
+
+        # Default Cache Behavior (API - no caching)
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub ${EnvironmentName}-alb-origin
+          ViewerProtocolPolicy: https-only
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # AllViewer
+          Compress: true
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-cloudfront
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+#============================================================
+# Outputs
+#============================================================
+Outputs:
+  CloudFrontDomainName:
+    Description: CloudFront distribution domain name (use this to access LiteLLM)
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub ${EnvironmentName}-CloudFrontDomain
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub ${EnvironmentName}-CloudFrontDistributionId
+
+  CloudFrontUrl:
+    Description: LiteLLM public URL via CloudFront
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+
+  WAFWebACLArn:
+    Description: WAF Web ACL ARN
+    Value: !GetAtt WAFWebACL.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-WAFWebACLArn
+
+  WAFWebACLId:
+    Description: WAF Web ACL ID
+    Value: !Ref WAFWebACL

@@ -1,0 +1,94 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  S3 Bucket for LiteLLM - Private access only, no public access.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: litellm
+    Description: Environment name prefix
+
+Resources:
+  #============================================================
+  # S3 Bucket
+  #============================================================
+  LiteLLMBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub litellm-${EnvironmentName}-${AWS::AccountId}-${AWS::Region}
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: IntelligentTiering
+            Status: Enabled
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 0
+      Tags:
+        - Key: Name
+          Value: !Sub litellm-${EnvironmentName}-bucket
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  #============================================================
+  # Bucket Policy - Deny all public access & enforce HTTPS
+  #============================================================
+  LiteLLMBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LiteLLMBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt LiteLLMBucket.Arn
+              - !Sub ${LiteLLMBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Sid: DenyPublicAccess
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub ${LiteLLMBucket.Arn}/*
+            Condition:
+              StringEquals:
+                s3:DataAccessPointAccount: ''
+
+#============================================================
+# Outputs
+#============================================================
+Outputs:
+  BucketName:
+    Description: S3 Bucket name
+    Value: !Ref LiteLLMBucket
+    Export:
+      Name: !Sub ${EnvironmentName}-S3BucketName
+
+  BucketArn:
+    Description: S3 Bucket ARN
+    Value: !GetAtt LiteLLMBucket.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-S3BucketArn
+
+  BucketDomainName:
+    Description: S3 Bucket domain name
+    Value: !GetAtt LiteLLMBucket.DomainName
