@@ -567,3 +567,6 @@ CloudWatch Logs ──▶ Subscription Filter ──▶ Lambda ──▶ SNS 告
 ```
 
 > ⚠️ Aurora 删除时会自动创建最终快照。S3 和 DynamoDB 设置了 Retain 策略，删除栈后数据保留。
+
+## 参考资料
+1. litellm logging的其他存储方式：https://docs.litellm.ai/docs/proxy/logging
