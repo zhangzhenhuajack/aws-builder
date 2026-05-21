@@ -407,6 +407,58 @@ WAF 拦截日志可在 AWS Console 查看：
 
 ## 故障排查
 
+### WAF 误拦截导致 403 ERROR
+
+**症状**：访问 CloudFront 域名返回 `403 ERROR - Request blocked`，错误页面由 CloudFront 生成。
+
+**原因**：WAF `AWSManagedRulesCommonRuleSet` 中的规则会检查请求 body，当 body 中包含类似攻击模式的内容时会误判拦截。常见触发规则：
+
+| 规则名 | 触发原因 |
+|--------|----------|
+| `EC2MetaDataSSRF_BODY` | Body 中包含 `169.254.169.254` 或 `/latest/meta-data/` 等模式（如代码片段、AWS 文档内容） |
+| `GenericRFI_BODY` | Body 中包含 URL 模式（如 `http://`、`https://`），被误判为远程文件包含攻击 |
+| `SizeRestrictions_BODY` | Body 超过 8KB（LLM 对话上下文通常远超此限制） |
+
+**排查步骤**：
+
+```bash
+# 1. 查看 WAF 采样请求，确认哪条规则触发了 Block
+aws wafv2 get-sampled-requests \
+  --web-acl-arn "arn:aws:wafv2:us-east-1:<ACCOUNT_ID>:global/webacl/litellm-waf/<WAF_ID>" \
+  --rule-metric-name litellm-common-rules \
+  --scope CLOUDFRONT \
+  --time-window StartTime=$(date -u -v-1H +%Y-%m-%dT%H:%M:%SZ),EndTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  --max-items 10 --region us-east-1
+
+# 2. 查看返回结果中的 "Action": "BLOCK" 和 "RuleNameWithinRuleGroup" 字段
+```
+
+**修复方案**：将误报规则加入排除列表（ExcludedRules），排除后规则变为 Count 模式（仅记录不拦截）：
+
+```bash
+# 在 AWSManagedRulesCommonRuleSet 的 ExcludedRules 中添加误报规则
+# 当前已排除：SizeRestrictions_BODY, EC2MetaDataSSRF_BODY, GenericRFI_BODY
+aws wafv2 update-web-acl --name litellm-waf --scope CLOUDFRONT \
+  --id <WAF_ID> --lock-token <LOCK_TOKEN> \
+  --default-action '{"Allow":{}}' \
+  --visibility-config '...' \
+  --rules '[... "ExcludedRules": [{"Name":"SizeRestrictions_BODY"},{"Name":"EC2MetaDataSSRF_BODY"},{"Name":"GenericRFI_BODY"}] ...]'
+```
+
+**临时方案**：如果需要快速恢复，可以直接从 CloudFront 分离 WAF：
+
+```bash
+# 获取当前 ETag
+ETAG=$(aws cloudfront get-distribution-config --id <CF_DIST_ID> --query 'ETag' --output text)
+
+# 下载配置，将 WebACLId 改为空字符串，然后更新
+aws cloudfront get-distribution-config --id <CF_DIST_ID> --query 'DistributionConfig' > /tmp/cf-config.json
+# 编辑 /tmp/cf-config.json: "WebACLId": ""
+aws cloudfront update-distribution --id <CF_DIST_ID> --if-match $ETAG --distribution-config file:///tmp/cf-config.json
+```
+
+> ⚠️ **注意**：对于 LLM 代理场景，请求 body 通常包含大量代码、URL、AWS 相关内容，WAF 通用规则集误报率较高。建议保留速率限制和 IP 信誉规则，但对 body 检查类规则设置排除。
+
 ### 容器健康检查失败
 ```bash
 # 查看 ECS 服务事件
