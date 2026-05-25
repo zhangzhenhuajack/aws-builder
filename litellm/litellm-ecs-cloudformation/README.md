@@ -139,6 +139,8 @@ chmod +x deploy.sh
 
 ## 部署后操作
 
+完成步骤 1、2 后，访问 CloudFront 地址的 `/ui` 路径，使用 `admin` 和 Master Key 作为密码登录即可使用。步骤 3、4 为后续运维按需执行。
+
 ### 1. 获取 LiteLLM Master Key
 
 ```bash
@@ -147,20 +149,22 @@ aws secretsmanager get-secret-value \
   --query SecretString --output text | jq -r .LITELLM_MASTER_KEY
 ```
 
-### 2. 获取数据库密码
+### 2. 获取 CloudFront 访问地址
+
+```bash
+aws cloudformation describe-stacks \
+  --stack-name litellm-cloudfront \
+  --region us-east-1 \
+  --query 'Stacks[0].Outputs[?OutputKey==`DistributionDomainName`].OutputValue' \
+  --output text
+```
+
+### 3. 获取数据库密码
 
 ```bash
 aws secretsmanager get-secret-value \
   --secret-id litellm/aurora/master-password \
   --query SecretString --output text | jq -r .password
-```
-
-### 3. 获取 Bedrock 凭证
-
-```bash
-aws secretsmanager get-secret-value \
-  --secret-id litellm/litellm/bedrock-credentials \
-  --query SecretString --output text | jq .
 ```
 
 ### 4. 更新 LiteLLM 配置
