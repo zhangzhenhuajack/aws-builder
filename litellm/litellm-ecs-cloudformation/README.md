@@ -117,7 +117,7 @@
 
 - AWS CLI v2 已安装并配置凭证
 - `jq` 已安装（用于解析 Secrets Manager 输出）
-- IAM 权限：CloudFormation、VPC、ECS、RDS、ElastiCache、DynamoDB、S3、IAM、Secrets Manager、Bedrock
+- IAM 权限：CloudFormation、VPC、ECS、RDS、ElastiCache、DynamoDB、S3、IAM、Secrets Manager、Bedrock、CloudWatch Logs、CloudFront、WAFv2
 
 ## 快速部署
 
@@ -186,7 +186,7 @@ aws ecs update-service --cluster litellm-ecs-cluster \
 
 | 命令 | 说明 |
 |------|------|
-| `./deploy.sh deploy-all` | 部署所有栈 |
+| `./deploy.sh deploy-all` | 部署所有栈（可重复执行，已成功的栈会自动跳过。如果中途报错，修复问题后重新执行即可，不会重复创建已成功的资源。若栈处于 `ROLLBACK_COMPLETE` 状态需先手动删除该栈再重试） |
 | `./deploy.sh deploy-vpc` | 部署 VPC |
 | `./deploy.sh deploy-s3` | 部署 S3 |
 | `./deploy.sh deploy-db` | 部署 Database |
@@ -388,22 +388,20 @@ WAF 拦截日志可在 AWS Console 查看：
 - CloudWatch Metrics: `AWS/WAFV2` → `AllowedRequests` / `BlockedRequests`
 - WAF Sampled Requests: 查看被拦截的具体请求详情
 
-## 费用估算
+## 费用相关资源
 
-| 资源 | 预估月费用 |
-|------|-----------|
-| NAT Gateway × 2 | ~$65 固定 + 数据传输费 |
-| Aurora Serverless v2 (0.5 ACU min) | ~$43 起 |
-| ElastiCache Redis Serverless | ~$0 起（按用量） |
-| DynamoDB On-Demand | ~$0 起（按请求） |
-| ECS Fargate (2 vCPU / 4GB × 1) | ~$70/月 |
-| ALB | ~$16 固定 + LCU 费 |
-| CloudFront | 按请求和流量计费 |
-| WAF | ~$5 + 规则费 |
-| S3 (Intelligent-Tiering) | 按存储量 |
-| Secrets Manager | ~$2.40 (6 secrets) |
-
-> 💡 最小配置（1 副本）月费约 **$200**。生产环境（2 副本 + CloudFront）约 **$350**。
+| 资源 | 说明 |
+|------|------|
+| NAT Gateway × 2 | 每 AZ 一个，提供私有子网出网能力 |
+| Aurora Serverless v2 | 0.5 ~ 8 ACU，按需自动扩缩 |
+| ElastiCache Redis Serverless | 按用量自动扩缩 |
+| DynamoDB On-Demand | PAY_PER_REQUEST 模式 |
+| ECS Fargate | 按 vCPU + 内存计费 |
+| ALB (Internal) | 内网负载均衡 |
+| CloudFront | CDN 分发（可选） |
+| WAF | Web 应用防火墙（可选） |
+| S3 (Intelligent-Tiering) | 自动分层存储 |
+| Secrets Manager | 密钥托管（6 个 Secret） |
 
 ## 故障排查
 
@@ -458,6 +456,25 @@ aws cloudfront update-distribution --id <CF_DIST_ID> --if-match $ETAG --distribu
 ```
 
 > ⚠️ **注意**：对于 LLM 代理场景，请求 body 通常包含大量代码、URL、AWS 相关内容，WAF 通用规则集误报率较高。建议保留速率限制和 IP 信誉规则，但对 body 检查类规则设置排除。
+
+### IAM Managed Policy 数量超限（选定的策略超出了此账户的配额）
+
+**症状**：给 IAM 用户附加 Policy 时报错 `选定的策略超出了此账户的配额`，因为每个用户默认最多附加 10 个 managed policy。
+
+**解决方案一：申请 Quota 提升（控制台）**
+
+1. 打开 [Service Quotas 控制台](https://console.aws.amazon.com/servicequotas/home/services/iam/quotas)
+2. 搜索 `Policies attached to an IAM user`
+3. 点击进入，点右上角 **Request quota increase**
+4. 填写新值（如 `20`），提交等待审批（1-3 个工作日）
+
+**解决方案二：使用 Inline Policy（立即生效，不占 managed policy 配额）**
+
+```bash
+aws iam put-user-policy --user-name YOUR_USER \
+  --policy-name CloudWatchLogsAccess \
+  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"logs:*","Resource":"*"}]}'
+```
 
 ### 容器健康检查失败
 ```bash
