@@ -314,13 +314,6 @@ deploy_ecs() {
 
     log_info "ECS stack deployment completed!"
     show_outputs "${ECS_STACK_NAME}"
-
-    echo ""
-    log_warn "IMPORTANT: After first deployment, update the Bedrock token:"
-    echo "  aws secretsmanager put-secret-value \\"
-    echo "    --secret-id ${ENVIRONMENT_NAME}/litellm/bedrock-token \\"
-    echo "    --secret-string '{\"AWS_BEARER_TOKEN_BEDROCK\":\"YOUR_ACTUAL_TOKEN\"}' \\"
-    echo "    --region ${AWS_REGION}"
 }
 
 #============================================================

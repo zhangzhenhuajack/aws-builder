@@ -102,7 +102,7 @@
 | Internal ALB | 内网负载均衡，仅 VPC 内可访问 |
 | Auto Scaling | CPU 70% / Memory 80% 触发，最大 10 副本 |
 | IAM Roles | 最小权限：Secrets Manager、S3、Bedrock、DynamoDB |
-| Secrets Manager × 2 | Bedrock Token + Master Key（自动生成） |
+| Secrets Manager | Master Key（自动生成） |
 | CloudWatch Logs | 30 天保留 |
 
 ### CloudFront + WAF 栈（可选）
@@ -163,15 +163,7 @@ aws secretsmanager get-secret-value \
   --query SecretString --output text | jq .
 ```
 
-### 4. 更新 Bedrock Token（如使用 Bearer Token 方式）
-
-```bash
-aws secretsmanager put-secret-value \
-  --secret-id litellm/litellm/bedrock-token \
-  --secret-string '{"AWS_BEARER_TOKEN_BEDROCK":"YOUR_ACTUAL_TOKEN"}'
-```
-
-### 5. 更新 LiteLLM 配置
+### 4. 更新 LiteLLM 配置
 
 ```bash
 # 编辑 litellm_config.yaml 后重新上传
