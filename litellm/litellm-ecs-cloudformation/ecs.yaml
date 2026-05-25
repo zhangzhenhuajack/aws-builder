@@ -167,6 +167,15 @@ Resources:
                     - "${TableArn}/index/*"
                     - TableArn:
                         Fn::ImportValue: !Sub ${EnvironmentName}-DynamoDBTableArn
+        - PolicyName: ElastiCacheAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticache:Connect
+                  - elasticache:DescribeServerlessCaches
+                Resource: '*'
 
   #============================================================
   # Security Groups
