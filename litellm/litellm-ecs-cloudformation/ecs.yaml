@@ -188,11 +188,6 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-alb-sg
 
-  # NOTE: After deploying cloudfront-waf.yaml, run this to allow CloudFront VPC Origin:
-  #   CF_SG=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=CloudFront-VPCOrigins-Service-SG" --query "SecurityGroups[0].GroupId" --output text)
-  #   ALB_SG=$(aws cloudformation describe-stacks --stack-name litellm-ecs --query "Stacks[0].Outputs[?OutputKey=='ALBSecurityGroupId'].OutputValue" --output text)
-  #   aws ec2 authorize-security-group-ingress --group-id $ALB_SG --protocol tcp --port 80 --source-group $CF_SG
-
   ECSSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:

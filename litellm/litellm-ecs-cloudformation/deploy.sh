@@ -346,6 +346,28 @@ deploy_cloudfront() {
 
     log_info "CloudFront + WAF stack deployment completed!"
     show_outputs "${CF_STACK_NAME}"
+
+    # Auto-configure Security Group: allow CloudFront VPC Origin → ALB
+    log_info "Configuring Security Group: allowing CloudFront VPC Origin to access ALB..."
+    local cf_sg alb_sg
+    cf_sg=$(aws ec2 describe-security-groups --region "${AWS_REGION}" \
+        --filters "Name=group-name,Values=CloudFront-VPCOrigins-Service-SG" \
+        --query "SecurityGroups[0].GroupId" --output text 2>/dev/null)
+    alb_sg=$(aws cloudformation describe-stacks --stack-name "${ECS_STACK_NAME}" --region "${AWS_REGION}" \
+        --query "Stacks[0].Outputs[?OutputKey=='ALBSecurityGroupId'].OutputValue" --output text 2>/dev/null)
+
+    if [[ -n "${cf_sg}" && "${cf_sg}" != "None" && -n "${alb_sg}" && "${alb_sg}" != "None" ]]; then
+        aws ec2 authorize-security-group-ingress --group-id "${alb_sg}" \
+            --protocol tcp --port 80 --source-group "${cf_sg}" \
+            --region "${AWS_REGION}" 2>/dev/null && \
+            log_info "Security Group rule added: ${cf_sg} → ${alb_sg} (TCP:80)" || \
+            log_info "Security Group rule already exists (skipped)"
+    else
+        log_warn "Could not find CloudFront VPC Origin SG or ALB SG. Please add manually:"
+        echo "  CF_SG=\$(aws ec2 describe-security-groups --region ${AWS_REGION} --filters \"Name=group-name,Values=CloudFront-VPCOrigins-Service-SG\" --query \"SecurityGroups[0].GroupId\" --output text)"
+        echo "  ALB_SG=\$(aws cloudformation describe-stacks --stack-name ${ECS_STACK_NAME} --region ${AWS_REGION} --query \"Stacks[0].Outputs[?OutputKey=='ALBSecurityGroupId'].OutputValue\" --output text)"
+        echo "  aws ec2 authorize-security-group-ingress --group-id \$ALB_SG --protocol tcp --port 80 --source-group \$CF_SG --region ${AWS_REGION}"
+    fi
 }
 
 #============================================================

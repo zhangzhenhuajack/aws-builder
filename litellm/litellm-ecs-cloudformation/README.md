@@ -139,8 +139,6 @@ chmod +x deploy.sh
 
 ## 部署后操作
 
-完成步骤 1、2 后，访问 CloudFront 地址的 `/ui` 路径，使用 `admin` 和 Master Key 作为密码登录即可使用。步骤 3、4 为后续运维按需执行。
-
 ### 1. 获取 LiteLLM Master Key
 
 ```bash
@@ -158,8 +156,9 @@ aws cloudformation describe-stacks \
   --query 'Stacks[0].Outputs[?OutputKey==`DistributionDomainName`].OutputValue' \
   --output text
 ```
-
-### 3. 获取数据库密码
+> 完成步骤 1、2 后，访问 CloudFront 地址的 `/ui` 路径，使用 `admin` 和 Master Key 作为密码登录即可使用。
+>步骤 3、4 为后续运维按需执行。 
+### 3. 获取数据库密码 (可选)
 
 ```bash
 aws secretsmanager get-secret-value \
@@ -167,7 +166,7 @@ aws secretsmanager get-secret-value \
   --query SecretString --output text | jq -r .password
 ```
 
-### 4. 更新 LiteLLM 配置
+### 4. 更新 LiteLLM 配置(可选)
 
 ```bash
 # 编辑 litellm_config.yaml 后重新上传
@@ -400,6 +399,28 @@ WAF 拦截日志可在 AWS Console 查看：
 | Secrets Manager | 密钥托管（6 个 Secret） |
 
 ## 故障排查
+
+### CloudFront 访问返回 504 Gateway Timeout
+
+**症状**：部署完成后访问 CloudFront 域名返回 `504 ERROR`。
+
+**原因**：CloudFront VPC Origin 使用 AWS 托管的 Security Group（`CloudFront-VPCOrigins-Service-SG`），其流量不在 VPC CIDR（10.0.0.0/16）范围内，被 ALB Security Group 拦截。
+
+**修复**：`deploy.sh deploy-cloudfront` 已自动处理此步骤。如果仍出现 504，手动执行：
+
+```bash
+CF_SG=$(aws ec2 describe-security-groups --region us-east-1 \
+  --filters "Name=group-name,Values=CloudFront-VPCOrigins-Service-SG" \
+  --query "SecurityGroups[0].GroupId" --output text)
+
+ALB_SG=$(aws cloudformation describe-stacks --stack-name litellm-ecs --region us-east-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='ALBSecurityGroupId'].OutputValue" --output text)
+
+aws ec2 authorize-security-group-ingress --group-id $ALB_SG \
+  --protocol tcp --port 80 --source-group $CF_SG --region us-east-1
+```
+
+> 规则立即生效，无需重启任何服务。
 
 ### WAF 误拦截导致 403 ERROR
 
