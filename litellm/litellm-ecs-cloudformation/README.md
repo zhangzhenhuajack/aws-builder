@@ -400,6 +400,33 @@ WAF 拦截日志可在 AWS Console 查看：
 
 ## 故障排查
 
+### Claude Code 长任务报 "socket connection was closed unexpectedly"
+
+**症状**：Claude Code 执行长任务（如复杂代码生成、extended thinking）时报错：
+```
+API Error: The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()
+```
+
+**原因**：Claude Code 使用 extended thinking 时，模型会先进行长时间"思考"，在思考完成前不会产出任何 streaming token。超时链路中 CloudFront `OriginReadTimeout` 过短会导致连接被提前关闭。
+
+**超时链路**：
+```
+Claude Code ──▶ CloudFront (OriginReadTimeout) ──▶ ALB (idle_timeout) ──▶ ECS/LiteLLM ──▶ Bedrock
+```
+
+**当前配置**（已优化）：
+
+| 组件 | 参数 | 值 | 说明 |
+|------|------|-----|------|
+| CloudFront | OriginReadTimeout | 180s | CloudFront 最大值 |
+| CloudFront | OriginKeepaliveTimeout | 60s | 保持长连接复用 |
+| ALB | idle_timeout | 300s | 必须 > CloudFront timeout |
+
+**如果 180s 仍不够**（CloudFront 硬限制）：
+
+1. **绕过 CloudFront 直连 ALB** — 将 ALB 改为 Internet-facing，Claude Code 的 `ANTHROPIC_BASE_URL` 直接指向 ALB 地址，ALB idle timeout 可设到 4000s
+2. **确认 streaming 正常** — 检查 LiteLLM 是否正确将 `stream: true` 传递给 Bedrock，streaming 模式下只要第一个 token 在 180s 内返回就不会超时
+
 ### CloudFront 访问返回 504 Gateway Timeout
 
 **症状**：部署完成后访问 CloudFront 域名返回 `504 ERROR`。
