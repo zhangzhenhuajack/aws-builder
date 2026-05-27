@@ -1,0 +1,30 @@
+# Dependency directories
+node_modules/
+
+# CDK output
+cdk.out/
+
+# TypeScript compiled output
+*.js
+*.d.ts
+*.js.map
+
+# Keep jest config
+!jest.config.js
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test coverage
+coverage/
+
+# npm
+*.tgz
+npm-debug.log*
