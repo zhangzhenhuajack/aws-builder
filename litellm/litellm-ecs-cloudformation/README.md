@@ -538,10 +538,32 @@ aws logs filter-log-events --log-group-name /ecs/litellm/litellm \
   --filter-pattern "database" --region us-east-1
 ```
 
-### 更新 LiteLLM 版本
+### 更新 LiteLLM 镜像版本
+
 ```bash
-LITELLM_IMAGE=ghcr.io/berriai/litellm:NEW_VERSION ./deploy.sh deploy-ecs
+# 1. 查看当前版本（查看 ECS Task Definition 中的镜像）
+aws ecs describe-task-definition \
+  --task-definition litellm-litellm-task \
+  --region us-east-1 \
+  --query 'taskDefinition.containerDefinitions[?name==`litellm`].image' \
+  --output text
+
+# 2. 查看可用版本（GitHub Container Registry）
+# 稳定版格式: v1.85.0, v1.85.1, ...
+# 开发版格式: 1.84.0-dev.2, ...
+# 浏览所有版本: https://github.com/BerriAI/litellm/pkgs/container/litellm
+
+# 3. 升级到指定版本
+LITELLM_IMAGE=ghcr.io/berriai/litellm:v1.85.1 ./deploy.sh deploy-ecs
+
+# 4. 验证部署状态
+aws ecs describe-services --cluster litellm-ecs-cluster \
+  --services litellm-litellm-service --region us-east-1 \
+  --query 'services[0].deployments[*].{status:status,desired:desiredCount,running:runningCount,rolloutState:rolloutState}' \
+  --output table
 ```
+
+> 💡 `deploy-ecs` 会通过 CloudFormation 更新 Task Definition 并触发滚动部署，旧任务在新任务健康检查通过后自动停止，零停机。
 
 ## 验证测试
 
