@@ -244,6 +244,42 @@ aws ecs update-service --cluster litellm-ecs-cluster \
 
 ## 安全特性
 
+### WAF IP 白名单管理
+
+使用 `waf-whitelist.sh` 脚本管理 WAF IP 白名单，白名单内的 IP 将跳过所有 WAF 规则检查。
+
+#### 使用方法
+
+```bash
+chmod +x waf-whitelist.sh
+
+# 创建白名单（首次）
+./waf-whitelist.sh create 1.2.3.4/32 10.0.0.0/8 192.168.1.0/24
+
+# 更新白名单（全量替换）
+./waf-whitelist.sh update 1.2.3.4/32 5.6.7.0/24 新IP/32
+
+# 查看当前白名单
+./waf-whitelist.sh list
+
+# 删除白名单（移除规则和 IP Set）
+./waf-whitelist.sh delete
+```
+
+#### 说明
+
+| 命令 | 说明 |
+|------|------|
+| `create` | 创建 IP Set + 在 WAF 中添加优先级最高的 Allow 规则 |
+| `update` | 全量替换白名单 IP 列表（不影响 WAF 规则） |
+| `list` | 查看当前白名单中的 IP 列表 |
+| `delete` | 从 WAF 移除白名单规则并删除 IP Set |
+
+- IP 地址必须为 CIDR 格式（如 `1.2.3.4/32` 表示单个 IP，`10.0.0.0/8` 表示网段）
+- 白名单规则优先级为 0（最高），匹配后直接放行，不经过后续 WAF 规则
+- 也可以编辑脚本顶部的 `WHITELIST_IPS` 数组预填 IP，然后不带参数执行
+
+
 ### 认证与密钥管理
 
 | 组件 | 安全措施 |
