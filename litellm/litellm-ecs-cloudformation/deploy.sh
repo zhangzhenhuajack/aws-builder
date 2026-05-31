@@ -281,6 +281,17 @@ upload_config() {
         --region "${AWS_REGION}"
 
     log_info "Config uploaded successfully!"
+
+    # Force ECS redeployment to load new config
+    log_info "Triggering ECS force new deployment..."
+    aws ecs update-service \
+        --cluster "${ENVIRONMENT_NAME}-ecs-cluster" \
+        --service "${ENVIRONMENT_NAME}-${ENVIRONMENT_NAME}-service" \
+        --force-new-deployment \
+        --region "${AWS_REGION}" \
+        --query 'service.{status:status,desiredCount:desiredCount}' \
+        --output json > /dev/null
+    log_info "ECS redeployment triggered. New tasks will load updated config."
 }
 
 #============================================================
