@@ -9,12 +9,12 @@
 set -euo pipefail
 
 #============================================================
-# 配置区域 - 在这里填写你的 IP 白名单（CIDR 格式）
+# IP 白名单 - 通过命令行参数传入，或在这里预填
+# 用法: ./waf-whitelist.sh create 1.2.3.4/32 10.0.0.0/8
 #============================================================
 WHITELIST_IPS=(
   # "1.2.3.4/32"        # 示例：单个 IP
   # "10.0.0.0/8"        # 示例：IP 段
-  # "192.168.1.0/24"    # 示例：子网
 )
 
 #============================================================
@@ -237,19 +237,26 @@ cmd_delete() {
 #============================================================
 # 主入口
 #============================================================
-case "${1:-help}" in
-  create) cmd_create ;;
-  update) cmd_update ;;
+CMD="${1:-help}"
+case "${CMD}" in
+  create|update)
+    # 命令行参数覆盖脚本中预填的 IP
+    if [[ $# -gt 1 ]]; then
+      shift
+      WHITELIST_IPS=("$@")
+    fi
+    [[ "${CMD}" == "create" ]] && cmd_create || cmd_update
+    ;;
   list)   cmd_list ;;
   delete) cmd_delete ;;
   *)
-    echo "用法: $0 {create|update|list|delete}"
+    echo "用法: $0 {create|update|list|delete} [IP/CIDR ...]"
     echo ""
-    echo "  create  - 创建 IP Set 并添加白名单规则到 WAF"
-    echo "  update  - 更新白名单 IP 列表"
-    echo "  list    - 查看当前白名单"
-    echo "  delete  - 删除白名单规则和 IP Set"
+    echo "  create 1.2.3.4/32 10.0.0.0/8  - 创建白名单并添加 IP"
+    echo "  update 1.2.3.4/32 5.6.7.0/24  - 更新白名单 IP 列表（全量替换）"
+    echo "  list                           - 查看当前白名单"
+    echo "  delete                         - 删除白名单规则和 IP Set"
     echo ""
-    echo "请先编辑脚本顶部的 WHITELIST_IPS 数组填写 IP 地址"
+    echo "IP 可通过命令行参数传入，也可编辑脚本顶部的 WHITELIST_IPS 数组"
     ;;
 esac
