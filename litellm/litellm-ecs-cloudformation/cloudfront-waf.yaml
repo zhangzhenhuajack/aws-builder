@@ -126,7 +126,7 @@ Resources:
               Fn::ImportValue: !Sub ${EnvironmentName}-ALBDnsName
             VpcOriginConfig:
               VpcOriginId: !GetAtt CloudFrontVpcOrigin.Id
-              OriginReadTimeout: 180
+              OriginReadTimeout: 120
               OriginKeepaliveTimeout: 60
 
         # Default Cache Behavior (API - no caching)
