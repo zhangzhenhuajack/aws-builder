@@ -31,7 +31,7 @@ S3_STACK_NAME="${S3_STACK_NAME:-litellm-s3}"
 
 # ECS Configuration
 ECS_STACK_NAME="${ECS_STACK_NAME:-litellm-ecs}"
-LITELLM_IMAGE="${LITELLM_IMAGE:-ghcr.io/berriai/litellm:1.84.0-dev.2}"
+LITELLM_IMAGE="${LITELLM_IMAGE:-ghcr.io/berriai/litellm:v1.85.1}"
 TASK_CPU="${TASK_CPU:-2048}"
 TASK_MEMORY="${TASK_MEMORY:-4096}"
 DESIRED_COUNT="${DESIRED_COUNT:-2}"
@@ -298,6 +298,14 @@ upload_config() {
 # ECS Deployment
 #============================================================
 deploy_ecs() {
+    # 交互式提示输入镜像版本
+    echo ""
+    log_info "当前默认镜像: ${LITELLM_IMAGE}"
+    read -p "请输入 LiteLLM 镜像地址 (直接回车使用默认值): " input_image
+    if [[ -n "${input_image}" ]]; then
+        LITELLM_IMAGE="${input_image}"
+    fi
+
     log_info "Deploying ECS stack: ${ECS_STACK_NAME} in region: ${AWS_REGION}"
     log_info "Image: ${LITELLM_IMAGE}"
     log_info "CPU: ${TASK_CPU} units, Memory: ${TASK_MEMORY} MB"

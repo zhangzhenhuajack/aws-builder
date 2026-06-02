@@ -297,7 +297,7 @@ chmod +x manage-waf-ip-whitelist.sh
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `ECS_STACK_NAME` | litellm-ecs | 栈名称 |
-| `LITELLM_IMAGE` | ghcr.io/berriai/litellm:1.84.0-dev.2 | Docker 镜像 |
+| `LITELLM_IMAGE` | ghcr.io/berriai/litellm:v1.85.1 | Docker 镜像 |
 | `TASK_CPU` | 2048 | CPU 单位 (2 vCPU) |
 | `TASK_MEMORY` | 4096 | 内存 (4 GB) |
 | `DESIRED_COUNT` | 2 | 期望副本数 |
