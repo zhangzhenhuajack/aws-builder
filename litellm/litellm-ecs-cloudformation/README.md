@@ -54,6 +54,7 @@
 | `cloudfront-waf.yaml` | litellm-cloudfront | CloudFront + WAF（可选） |
 | `litellm_config.yaml` | - | LiteLLM 应用配置（上传到 S3） |
 | `deploy.sh` | - | 一键部署脚本 |
+| `manage-waf-ip-whitelist.sh` | - | WAF IP 白名单管理脚本 |
 
 ## 资源清单
 
@@ -176,6 +177,73 @@ aws secretsmanager get-secret-value \
 aws ecs update-service --cluster litellm-ecs-cluster \
   --service litellm-litellm-service --force-new-deployment --region us-east-1
 ```
+
+### 5. WAF IP 白名单管理
+
+提供独立脚本 `manage-waf-ip-whitelist.sh` 管理 WAF IP 白名单，支持 deny-all 模式（仅允许白名单 IP 访问）和 allow-all 模式（默认放行，仅拦截恶意请求）。
+
+#### 首次配置
+
+```bash
+chmod +x manage-waf-ip-whitelist.sh
+
+# 1. 添加你的出口 IP 到白名单
+./manage-waf-ip-whitelist.sh add 你的IP/32
+
+# 2. 将 IP 白名单规则添加到 WAF WebACL
+./manage-waf-ip-whitelist.sh attach
+
+# 3. 将 WAF 绑定到 CloudFront Distribution（如果尚未绑定）
+./manage-waf-ip-whitelist.sh bindcf <distribution-id>
+
+# 4. 切换为 deny-all 模式（只允许白名单 IP 访问，其他全部 403）
+./manage-waf-ip-whitelist.sh mode deny-all
+```
+
+#### 日常管理
+
+```bash
+# 查看白名单
+./manage-waf-ip-whitelist.sh list
+
+# 添加 IP（CIDR 格式）
+./manage-waf-ip-whitelist.sh add 203.0.113.0/24 198.51.100.10/32
+
+# 移除 IP
+./manage-waf-ip-whitelist.sh remove 203.0.113.0/24
+
+# 查看 WAF 完整状态（模式、规则、绑定的 CF、白名单 IP）
+./manage-waf-ip-whitelist.sh status
+```
+
+#### 紧急恢复
+
+```bash
+# 放开所有访问（关闭 IP 白名单限制）
+./manage-waf-ip-whitelist.sh mode allow-all
+
+# 从 CloudFront 解绑 WAF
+./manage-waf-ip-whitelist.sh unbindcf <distribution-id>
+```
+
+#### 命令一览
+
+| 命令 | 说明 |
+|------|------|
+| `list` | 查看当前白名单 IP 列表 |
+| `add <ip>...` | 添加 IP 到白名单（CIDR 格式，单 IP 用 /32） |
+| `remove <ip>...` | 从白名单移除 IP |
+| `attach` | 将白名单规则添加到 WAF WebACL（只需执行一次） |
+| `mode deny-all` | 切换为只允许白名单 IP 访问 |
+| `mode allow-all` | 切换为默认放行 |
+| `bindcf <id>` | 将 WAF 绑定到指定 CloudFront Distribution |
+| `unbindcf <id>` | 从 CloudFront Distribution 解绑 WAF |
+| `status` | 查看 WAF 完整状态 |
+
+> ⚠️ **注意**：
+> - IP 必须使用 CIDR 格式，单个 IP 使用 `/32`，网段使用 `/16`、`/24` 等
+> - WAF for CloudFront 固定在 `us-east-1` 区域操作
+> - 从 AWS 内网访问时，CloudFront 看到的客户端 IP 可能与 `checkip.amazonaws.com` 返回的不同，建议使用较大网段（如 `/16`）覆盖
 
 ## 脚本命令
 
