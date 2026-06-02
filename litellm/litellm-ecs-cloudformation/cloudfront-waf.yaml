@@ -19,10 +19,7 @@ Parameters:
     Default: ''
     Description: ACM Certificate ARN for custom domain (required if DomainName is set, must be in us-east-1)
 
-  RateLimitPerIP:
-    Type: Number
-    Default: 2000
-    Description: Maximum requests per 5-minute window per IP address
+
 
 Conditions:
   HasCustomDomain: !Not [!Equals [!Ref DomainName, '']]
@@ -44,25 +41,9 @@ Resources:
         CloudWatchMetricsEnabled: true
         MetricName: !Sub ${EnvironmentName}-waf-metrics
       Rules:
-        # Rule 1: AWS Managed Common Rule Set
-        - Name: AWSManagedRulesCommonRuleSet
-          Priority: 1
-          OverrideAction:
-            None: {}
-          Statement:
-            ManagedRuleGroupStatement:
-              VendorName: AWS
-              Name: AWSManagedRulesCommonRuleSet
-              ExcludedRules:
-                - Name: SizeRestrictions_BODY
-          VisibilityConfig:
-            SampledRequestsEnabled: true
-            CloudWatchMetricsEnabled: true
-            MetricName: !Sub ${EnvironmentName}-common-rules
-
-        # Rule 2: AWS Managed Known Bad Inputs
+        # Rule 1: AWS Managed Known Bad Inputs
         - Name: AWSManagedRulesKnownBadInputsRuleSet
-          Priority: 2
+          Priority: 1
           OverrideAction:
             None: {}
           Statement:
@@ -74,37 +55,9 @@ Resources:
             CloudWatchMetricsEnabled: true
             MetricName: !Sub ${EnvironmentName}-bad-inputs
 
-        # Rule 3: AWS Managed SQL Injection
-        - Name: AWSManagedRulesSQLiRuleSet
-          Priority: 3
-          OverrideAction:
-            None: {}
-          Statement:
-            ManagedRuleGroupStatement:
-              VendorName: AWS
-              Name: AWSManagedRulesSQLiRuleSet
-          VisibilityConfig:
-            SampledRequestsEnabled: true
-            CloudWatchMetricsEnabled: true
-            MetricName: !Sub ${EnvironmentName}-sqli-rules
-
-        # Rule 4: Rate Limiting per IP
-        - Name: RateLimitPerIP
-          Priority: 4
-          Action:
-            Block: {}
-          Statement:
-            RateBasedStatement:
-              Limit: !Ref RateLimitPerIP
-              AggregateKeyType: IP
-          VisibilityConfig:
-            SampledRequestsEnabled: true
-            CloudWatchMetricsEnabled: true
-            MetricName: !Sub ${EnvironmentName}-rate-limit
-
-        # Rule 5: AWS Managed IP Reputation List
+        # Rule 2: AWS Managed IP Reputation List
         - Name: AWSManagedRulesAmazonIpReputationList
-          Priority: 5
+          Priority: 2
           OverrideAction:
             None: {}
           Statement:
