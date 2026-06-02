@@ -349,6 +349,10 @@ Resources:
                 Fn::ImportValue: !Sub ${EnvironmentName}-S3BucketName
             - Name: AWS_DEFAULT_REGION
               Value: !Ref AWS::Region
+            - Name: NO_DOCS
+              Value: "True"
+            - Name: NO_REDOC
+              Value: "True"
           Secrets:
             - Name: LITELLM_MASTER_KEY
               ValueFrom: !Sub "${MasterKeySecret}:LITELLM_MASTER_KEY::"
