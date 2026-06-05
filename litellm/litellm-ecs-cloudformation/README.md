@@ -297,7 +297,7 @@ chmod +x manage-waf-ip-whitelist.sh
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `ECS_STACK_NAME` | litellm-ecs | 栈名称 |
-| `LITELLM_IMAGE` | ghcr.io/berriai/litellm:1.84.0-dev.2 | Docker 镜像 |
+| `LITELLM_IMAGE` | ghcr.io/berriai/litellm:v1.85.1 | Docker 镜像 |
 | `TASK_CPU` | 2048 | CPU 单位 (2 vCPU) |
 | `TASK_MEMORY` | 4096 | 内存 (4 GB) |
 | `DESIRED_COUNT` | 2 | 期望副本数 |
@@ -770,6 +770,13 @@ CloudWatch Logs ──▶ Subscription Filter ──▶ Lambda ──▶ SNS 告
 ```
 
 > ⚠️ Aurora 删除时会自动创建最终快照。S3 和 DynamoDB 设置了 Retain 策略，删除栈后数据保留。
+
+## 客户端接入指南
+
+| 文档 | 说明 |
+|------|------|
+| [Claude Code & Desktop 接入](./claude-code-desktop-litellm-bedrock.md) | Claude Code 和 Claude Desktop 通过 LiteLLM 调用 Bedrock |
+| [OpenAI Codex 接入](./openai-codex-litellm-bedrock.md) | OpenAI Codex CLI/App 通过 LiteLLM 调用 Bedrock |
 
 ## 参考资料
 1. litellm logging的其他存储方式：https://docs.litellm.ai/docs/proxy/logging
