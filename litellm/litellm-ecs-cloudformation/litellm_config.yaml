@@ -17,6 +17,8 @@ model_list:
       model: openai/openai.gpt-5.5
       api_base: https://bedrock-mantle.us-east-2.api.aws/openai/v1
       api_key: os.environ/BEDROCK_MANTLE_API_KEY
+      drop_params: true
+      additional_drop_params: ["client_metadata", "metadata"]
 
   # GPT-5.4 — 最佳性价比（us-east-2 主 + us-west-2 fallback）
   - model_name: gpt-5.4
@@ -24,6 +26,8 @@ model_list:
       model: openai/openai.gpt-5.4
       api_base: https://bedrock-mantle.us-east-2.api.aws/openai/v1
       api_key: os.environ/BEDROCK_MANTLE_API_KEY
+      drop_params: true
+      additional_drop_params: ["client_metadata", "metadata"]
 
 general_settings:
   database_url: os.environ/DATABASE_URL
