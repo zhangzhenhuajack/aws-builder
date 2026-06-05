@@ -61,6 +61,21 @@ Resources:
           Value: !Ref EnvironmentName
 
   #============================================================
+  # Secrets Manager - Bedrock Mantle API Key
+  #============================================================
+  BedrockMantleApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${EnvironmentName}/litellm/bedrock-mantle-api-key
+      Description: Bedrock Mantle API Key for OpenAI-compatible GPT models
+      SecretString: '{"BEDROCK_MANTLE_API_KEY":"PLACEHOLDER"}'
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-bedrock-mantle-api-key
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  #============================================================
   # ECS Cluster
   #============================================================
   ECSCluster:
@@ -104,6 +119,7 @@ Resources:
                   - secretsmanager:GetSecretValue
                 Resource:
                   - !Ref MasterKeySecret
+                  - !Ref BedrockMantleApiKeySecret
                   - Fn::ImportValue: !Sub ${EnvironmentName}-AuroraSecretArn
 
   TaskRole:
@@ -356,6 +372,8 @@ Resources:
           Secrets:
             - Name: LITELLM_MASTER_KEY
               ValueFrom: !Sub "${MasterKeySecret}:LITELLM_MASTER_KEY::"
+            - Name: BEDROCK_MANTLE_API_KEY
+              ValueFrom: !Sub "${BedrockMantleApiKeySecret}:BEDROCK_MANTLE_API_KEY::"
             - Name: DB_USERNAME
               ValueFrom: !Sub
                 - "${SecretArn}:username::"

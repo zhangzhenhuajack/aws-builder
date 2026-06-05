@@ -261,6 +261,36 @@ deploy_bedrock() {
 }
 
 #============================================================
+# Upload Bedrock Mantle API Key to Secrets Manager
+#============================================================
+upload_mantle_key() {
+    log_info "Uploading Bedrock Mantle API Key to Secrets Manager..."
+
+    local env_file="${HOME}/.codex/.env"
+    if [[ ! -f "${env_file}" ]]; then
+        log_error "File not found: ${env_file}"
+        exit 1
+    fi
+
+    local api_key
+    api_key=$(grep '^AWS_BEARER_TOKEN_BEDROCK=' "${env_file}" | cut -d'=' -f2-)
+
+    if [[ -z "${api_key}" ]]; then
+        log_error "AWS_BEARER_TOKEN_BEDROCK not found in ${env_file}"
+        exit 1
+    fi
+
+    local secret_id="${ENVIRONMENT_NAME}/litellm/bedrock-mantle-api-key"
+
+    aws secretsmanager put-secret-value \
+        --secret-id "${secret_id}" \
+        --secret-string "{\"BEDROCK_MANTLE_API_KEY\":\"${api_key}\"}" \
+        --region "${AWS_REGION}" 2>/dev/null && \
+        log_info "Bedrock Mantle API Key updated in Secrets Manager." || \
+        log_warn "Secret ${secret_id} not found yet. It will be created during deploy-ecs."
+}
+
+#============================================================
 # Upload LiteLLM config to S3
 #============================================================
 upload_config() {
@@ -400,6 +430,7 @@ deploy_all() {
     deploy_bedrock
     upload_config
     deploy_ecs
+    upload_mantle_key
     deploy_cloudfront
     log_info "All stacks deployed successfully!"
 }
@@ -517,6 +548,10 @@ main() {
         upload-config)
             check_prerequisites
             upload_config
+            ;;
+        upload-mantle-key)
+            check_prerequisites
+            upload_mantle_key
             ;;
         deploy-all|deploy)
             check_prerequisites
