@@ -2,10 +2,14 @@ model_list:
   - model_name: bedrock-claude-opus-4-6-v1
     litellm_params:
       model: bedrock/us.anthropic.claude-opus-4-6-v1
+      drop_params: true
+      additional_drop_params: ["client_metadata", "metadata"]
 
   - model_name: bedrock-claude-opus-4-7
     litellm_params:
       model: bedrock/us.anthropic.claude-opus-4-7
+      drop_params: true
+      additional_drop_params: ["client_metadata", "metadata"]
 
   # GPT-5.5 — 最强推理/编码能力
   - model_name: gpt-5.5
@@ -27,9 +31,11 @@ general_settings:
   store_model_in_db: true
 
 litellm_settings:
+  drop_params: true
   cache: true
   enable_redis_auth_cache: true
   store_audit_logs: true
+  additional_drop_params: ["client_metadata", "metadata"]
   cache_params:
     type: redis
     host: os.environ/REDIS_HOST
