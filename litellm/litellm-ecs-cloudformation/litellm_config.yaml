@@ -7,6 +7,20 @@ model_list:
     litellm_params:
       model: bedrock/us.anthropic.claude-opus-4-7
 
+  # GPT-5.5 — 最强推理/编码能力
+  - model_name: gpt-5.5
+    litellm_params:
+      model: openai/openai.gpt-5.5
+      api_base: https://bedrock-mantle.us-east-2.api.aws/openai/v1
+      api_key: os.environ/BEDROCK_MANTLE_API_KEY
+
+  # GPT-5.4 — 最佳性价比（us-east-2 主 + us-west-2 fallback）
+  - model_name: gpt-5.4
+    litellm_params:
+      model: openai/openai.gpt-5.4
+      api_base: https://bedrock-mantle.us-east-2.api.aws/openai/v1
+      api_key: os.environ/BEDROCK_MANTLE_API_KEY
+
 general_settings:
   database_url: os.environ/DATABASE_URL
   user_api_key_cache_ttl: 300

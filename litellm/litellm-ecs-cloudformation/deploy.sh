@@ -31,7 +31,7 @@ S3_STACK_NAME="${S3_STACK_NAME:-litellm-s3}"
 
 # ECS Configuration
 ECS_STACK_NAME="${ECS_STACK_NAME:-litellm-ecs}"
-LITELLM_IMAGE="${LITELLM_IMAGE:-ghcr.io/berriai/litellm:1.84.0-dev.2}"
+LITELLM_IMAGE="${LITELLM_IMAGE:-ghcr.io/berriai/litellm:v1.85.1}"
 TASK_CPU="${TASK_CPU:-2048}"
 TASK_MEMORY="${TASK_MEMORY:-4096}"
 DESIRED_COUNT="${DESIRED_COUNT:-2}"
@@ -261,6 +261,36 @@ deploy_bedrock() {
 }
 
 #============================================================
+# Upload Bedrock Mantle API Key to Secrets Manager
+#============================================================
+upload_mantle_key() {
+    log_info "Uploading Bedrock Mantle API Key to Secrets Manager..."
+
+    local env_file="${HOME}/.codex/.env"
+    if [[ ! -f "${env_file}" ]]; then
+        log_error "File not found: ${env_file}"
+        exit 1
+    fi
+
+    local api_key
+    api_key=$(grep '^AWS_BEARER_TOKEN_BEDROCK=' "${env_file}" | cut -d'=' -f2-)
+
+    if [[ -z "${api_key}" ]]; then
+        log_error "AWS_BEARER_TOKEN_BEDROCK not found in ${env_file}"
+        exit 1
+    fi
+
+    local secret_id="${ENVIRONMENT_NAME}/litellm/bedrock-mantle-api-key"
+
+    aws secretsmanager put-secret-value \
+        --secret-id "${secret_id}" \
+        --secret-string "{\"BEDROCK_MANTLE_API_KEY\":\"${api_key}\"}" \
+        --region "${AWS_REGION}" 2>/dev/null && \
+        log_info "Bedrock Mantle API Key updated in Secrets Manager." || \
+        log_warn "Secret ${secret_id} not found yet. It will be created during deploy-ecs."
+}
+
+#============================================================
 # Upload LiteLLM config to S3
 #============================================================
 upload_config() {
@@ -298,6 +328,14 @@ upload_config() {
 # ECS Deployment
 #============================================================
 deploy_ecs() {
+    # 交互式提示输入镜像版本
+    echo ""
+    log_info "当前默认镜像: ${LITELLM_IMAGE}"
+    read -p "请输入 LiteLLM 镜像地址 (直接回车使用默认值): " input_image
+    if [[ -n "${input_image}" ]]; then
+        LITELLM_IMAGE="${input_image}"
+    fi
+
     log_info "Deploying ECS stack: ${ECS_STACK_NAME} in region: ${AWS_REGION}"
     log_info "Image: ${LITELLM_IMAGE}"
     log_info "CPU: ${TASK_CPU} units, Memory: ${TASK_MEMORY} MB"
@@ -392,6 +430,7 @@ deploy_all() {
     deploy_bedrock
     upload_config
     deploy_ecs
+    upload_mantle_key
     deploy_cloudfront
     log_info "All stacks deployed successfully!"
 }
@@ -509,6 +548,10 @@ main() {
         upload-config)
             check_prerequisites
             upload_config
+            ;;
+        upload-mantle-key)
+            check_prerequisites
+            upload_mantle_key
             ;;
         deploy-all|deploy)
             check_prerequisites
