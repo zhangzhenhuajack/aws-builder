@@ -151,11 +151,168 @@ codex --model bedrock-claude-opus-4-7 --full-auto "refactor this file to use asy
 
 ---
 
-## 7. 方式二：Codex 直连 Bedrock（不经过 LiteLLM）
+## 7. 通过 LiteLLM 代理接入 Bedrock GPT-5.5 / GPT-5.4
 
-如果不需要 LiteLLM 的统一管控能力，Codex 也支持直连 Amazon Bedrock，原生调用 Bedrock 上的 OpenAI GPT 模型。
+除了 Codex 直连 Bedrock 外，也可以通过 LiteLLM 代理统一接入 GPT-5.5 和 GPT-5.4，获得费用追踪、审计日志和多模型管理能力。
 
-### 7.1 配置 `~/.codex/config.toml`
+![Bedrock GPT-5.5 通过 LiteLLM](./Bedrock-GPT5.5-Litellm.png)
+
+### 7.1 LiteLLM 配置文件添加模型
+
+在 `litellm_config.yaml` 的 `model_list` 中添加：
+
+```yaml
+  # GPT-5.5 — 最强推理/编码能力
+  - model_name: gpt-5.5
+    litellm_params:
+      model: openai/openai.gpt-5.5
+      api_base: https://bedrock-mantle.us-east-2.api.aws/openai/v1
+      api_key: os.environ/BEDROCK_MANTLE_API_KEY
+      drop_params: true
+      additional_drop_params: ["client_metadata", "metadata"]
+
+  # GPT-5.4 — 最佳性价比
+  - model_name: gpt-5.4
+    litellm_params:
+      model: openai/openai.gpt-5.4
+      api_base: https://bedrock-mantle.us-east-2.api.aws/openai/v1
+      api_key: os.environ/BEDROCK_MANTLE_API_KEY
+      drop_params: true
+      additional_drop_params: ["client_metadata", "metadata"]
+```
+
+同时在全局 `litellm_settings` 中启用 `drop_params`（确保数据库中动态添加的模型也生效）：
+
+```yaml
+litellm_settings:
+  drop_params: true
+  # ... 其他设置
+```
+
+### 7.2 将 API Key 存入 Secrets Manager
+
+Bedrock Mantle 使用 Bearer Token 认证。将 token 存入 AWS Secrets Manager，ECS 容器启动时自动注入：
+
+```bash
+# 从 ~/.codex/.env 获取 token 并存入 Secrets Manager
+aws secretsmanager put-secret-value \
+  --secret-id litellm/litellm/bedrock-mantle-api-key \
+  --secret-string '{"BEDROCK_MANTLE_API_KEY":"<your-bearer-token>"}' \
+  --region us-east-1
+```
+
+或使用部署脚本一键完成：
+
+```bash
+./deploy.sh upload-mantle-key
+```
+
+> ⚠️ Bedrock Mantle 的 Bearer Token 有有效期（通常 12 小时），过期后需重新执行上述命令更新 Secret 并触发 ECS 重新部署。
+
+### 7.3 ECS CloudFormation 变更
+
+`ecs.yaml` 需要添加以下资源：
+
+1. **新增 Secrets Manager Secret**：
+
+```yaml
+BedrockMantleApiKeySecret:
+  Type: AWS::SecretsManager::Secret
+  Properties:
+    Name: !Sub ${EnvironmentName}/litellm/bedrock-mantle-api-key
+    Description: Bedrock Mantle API Key for OpenAI-compatible GPT models
+    SecretString: '{"BEDROCK_MANTLE_API_KEY":"PLACEHOLDER"}'
+```
+
+2. **Task Execution Role 添加读取权限**：
+
+```yaml
+Resource:
+  - !Ref MasterKeySecret
+  - !Ref BedrockMantleApiKeySecret  # 新增
+  - Fn::ImportValue: !Sub ${EnvironmentName}-AuroraSecretArn
+```
+
+3. **容器 Secrets 注入环境变量**：
+
+```yaml
+Secrets:
+  - Name: BEDROCK_MANTLE_API_KEY
+    ValueFrom: !Sub "${BedrockMantleApiKeySecret}:BEDROCK_MANTLE_API_KEY::"
+```
+
+### 7.4 部署与验证
+
+```bash
+# 1. 上传配置文件
+./deploy.sh upload-config
+
+# 2. 部署 ECS 栈（创建 Secret + 更新 Task Definition）
+./deploy.sh deploy-ecs
+
+# 3. 写入实际 API Key
+./deploy.sh upload-mantle-key
+
+# 4. 触发重新部署加载新 Secret
+aws ecs update-service --cluster litellm-ecs-cluster \
+  --service litellm-litellm-service --force-new-deployment --region us-east-1
+
+# 5. 检查部署状态
+aws ecs describe-services --cluster litellm-ecs-cluster \
+  --services litellm-litellm-service --region us-east-1 \
+  --query 'services[0].deployments[*].{status:status,running:runningCount,rolloutState:rolloutState}' \
+  --output table
+```
+
+### 7.5 Codex 使用 GPT-5.5 通过 LiteLLM
+
+配置 `~/.codex/config.toml`：
+
+```toml
+model_provider = "litellm"
+model = "gpt-5.5"
+
+[model_providers.litellm]
+name = "LiteLLM Proxy"
+base_url = "https://<your-litellm-domain>/v1"
+env_key = "LITELLM_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+```
+
+测试：
+
+```bash
+codex --model gpt-5.5 "explain this function"
+codex --model gpt-5.4 --full-auto "add unit tests"
+```
+
+### 7.6 验证 API 调用
+
+```bash
+MASTER_KEY=$(aws secretsmanager get-secret-value \
+  --secret-id litellm/litellm/master-key \
+  --query SecretString --output text | jq -r .LITELLM_MASTER_KEY)
+
+# 测试 GPT-5.5
+curl -s https://<your-litellm-domain>/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $MASTER_KEY" \
+  -d '{
+    "model": "gpt-5.5",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+---
+
+## 8. ⭐ 方式二（推荐）：Codex 直连 Bedrock（不经过 LiteLLM）
+
+> **🎯 对于个人开发者，这是最推荐的方式。** 无需部署任何基础设施，只需 2 个配置文件即可让 Codex 直接调用 Bedrock 上的 GPT-5.5 / GPT-5.4，零运维成本、零额外费用、配置 30 秒搞定。
+
+如果不需要 LiteLLM 的统一管控能力（多用户管理、预算控制、审计日志），Codex 原生支持直连 Amazon Bedrock，直接调用 Bedrock 上的 OpenAI GPT 模型。
+
+### 8.1 配置 `~/.codex/config.toml`
 
 ```toml
 model = "openai.gpt-5.5"
@@ -165,7 +322,7 @@ model_provider = "amazon-bedrock"
 region = "us-east-2"
 ```
 
-### 7.2 配置 `~/.codex/.env`
+### 8.2 配置 `~/.codex/.env`
 
 Bedrock 使用 Bearer Token 认证，将以下内容写入 `~/.codex/.env`：
 
@@ -175,24 +332,25 @@ AWS_BEARER_TOKEN_BEDROCK=bedrock-api-key-<your-presigned-token>
 
 > **Token 获取方式**：通过 AWS Console 的 Bedrock 页面生成 API Key（Presigned URL 形式），有效期 12 小时。
 
-### 7.3 使用
+### 8.3 使用
 
 ```bash
 # 直接使用 Bedrock 上的 GPT-5.5
 codex "explain this codebase"
 ```
 
-### 7.4 两种方式对比
+### 8.4 两种方式对比
 
-| 对比项 | 直连 Bedrock | 通过 LiteLLM |
+| 对比项 | ⭐ 直连 Bedrock（推荐） | 通过 LiteLLM |
 |--------|-------------|-------------|
-| 配置复杂度 | 简单，2 个文件即可 | 需部署 LiteLLM 服务 |
-| 支持模型 | 仅 Bedrock 上已有的模型 | 100+ 模型（Bedrock + OpenAI + Gemini 等） |
-| 费用追踪 | 依赖 AWS Cost Explorer | LiteLLM 内置按用户/Key 统计 |
-| 预算控制 | 无内置，需结合 AWS Budgets | 实时限额、超额自动阻断 |
+| 配置复杂度 | ✅ 极简，2 个文件 30 秒搞定 | 需部署 LiteLLM 服务（ECS + DB + Redis） |
+| 额外费用 | ✅ 零，只付模型调用费 | ECS/Aurora/Redis/NAT 等基础设施费用 |
+| 支持模型 | Bedrock 上已有的模型 | 100+ 模型（Bedrock + OpenAI + Gemini 等） |
+| 费用追踪 | AWS Cost Explorer | LiteLLM 内置按用户/Key 统计 |
+| 预算控制 | AWS Budgets | 实时限额、超额自动阻断 |
 | Key 管理 | Bearer Token 有效期 12h，需定期刷新 | Virtual Key 长期有效，可随时撤销 |
 | 审计日志 | CloudTrail | 请求级日志含完整 Prompt/Response |
-| 适合场景 | 个人快速体验、临时使用 | 团队/企业长期使用 |
+| 适合场景 | ✅ **个人开发者、快速上手、日常编码** | 团队/企业多人协作、需要精细管控 |
 
 
 
