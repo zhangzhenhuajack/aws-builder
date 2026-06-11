@@ -45,6 +45,9 @@ CF_STACK_NAME="${CF_STACK_NAME:-litellm-cloudfront}"
 DOMAIN_NAME="${DOMAIN_NAME:-}"
 CERTIFICATE_ARN="${CERTIFICATE_ARN:-}"
 
+# Deploy Mode: "alb" (Public ALB + WAF) or "cloudfront" (Internal ALB + CloudFront + WAF)
+DEPLOY_MODE="${DEPLOY_MODE:-alb}"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -423,16 +426,26 @@ deploy_cloudfront() {
 # Deploy All
 #============================================================
 deploy_all() {
+    log_info "Deploy mode: ${DEPLOY_MODE}"
     log_info "Deploying all infrastructure..."
+
     deploy_vpc
     deploy_s3
     deploy_database
     deploy_bedrock
     upload_config
     deploy_ecs
-    upload_mantle_key
-    deploy_cloudfront
-    log_info "All stacks deployed successfully!"
+
+    if [[ "${DEPLOY_MODE}" == "cloudfront" ]]; then
+        upload_mantle_key
+        deploy_cloudfront
+        log_info "All stacks deployed! Access via CloudFront domain."
+    else
+        log_info "All stacks deployed! Access via Public ALB."
+        log_info ""
+        log_info "下一步：配置 ALB WAF IP 白名单限制访问："
+        log_info "  ./manage-alb-waf.sh setup"
+    fi
 }
 
 #============================================================
@@ -499,6 +512,7 @@ usage() {
     echo "Environment Variables:"
     echo "  ENVIRONMENT_NAME       Environment prefix (default: litellm)"
     echo "  AWS_REGION             AWS region (default: us-east-1)"
+    echo "  DEPLOY_MODE            'alb' (Public ALB + WAF, default) or 'cloudfront' (Internal ALB + CF)"
     echo ""
     echo "  VPC:"
     echo "  VPC_STACK_NAME         VPC stack name (default: litellm-vpc)"

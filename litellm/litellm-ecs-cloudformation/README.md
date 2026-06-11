@@ -50,11 +50,12 @@
 | `s3.yaml` | litellm-s3 | S3 存储桶（配置文件 + 日志） |
 | `database.yaml` | litellm-database | Aurora PostgreSQL + Redis + DynamoDB |
 | `bedrock.yaml` | litellm-bedrock | Bedrock IAM 用户 + 凭证 |
-| `ecs.yaml` | litellm-ecs | ECS Fargate + Internal ALB + Auto Scaling |
+| `ecs.yaml` | litellm-ecs | ECS Fargate + Public ALB + Auto Scaling |
 | `cloudfront-waf.yaml` | litellm-cloudfront | CloudFront + WAF（可选） |
 | `litellm_config.yaml` | - | LiteLLM 应用配置（上传到 S3） |
 | `deploy.sh` | - | 一键部署脚本 |
-| `manage-waf-ip-whitelist.sh` | - | WAF IP 白名单管理脚本 |
+| `manage-alb-waf.sh` | - | Public ALB WAF IP 白名单管理脚本 |
+| `manage-waf-ip-whitelist.sh` | - | CloudFront WAF IP 白名单管理脚本 |
 
 ## 资源清单
 
@@ -123,10 +124,14 @@
 ## 快速部署
 
 ```bash
-chmod +x deploy.sh
+chmod +x deploy.sh manage-alb-waf.sh
 
-# 一键部署全部（VPC → S3 → Database → Bedrock → Config → ECS → CloudFront）
+# 方案一：Public ALB + WAF IP 白名单（默认，推荐）
 ./deploy.sh deploy-all
+./manage-alb-waf.sh setup          # 交互式输入白名单 IP
+
+# 方案二：Internal ALB + CloudFront + WAF
+DEPLOY_MODE=cloudfront ./deploy.sh deploy-all
 
 # 或分步部署
 ./deploy.sh deploy-vpc
@@ -135,7 +140,8 @@ chmod +x deploy.sh
 ./deploy.sh deploy-bedrock
 ./deploy.sh upload-config
 ./deploy.sh deploy-ecs
-./deploy.sh deploy-cloudfront   # 可选
+./manage-alb-waf.sh setup          # ALB 方案：配置 WAF
+./deploy.sh deploy-cloudfront      # CloudFront 方案：部署 CF + WAF
 ```
 
 ## 部署后操作
@@ -178,9 +184,80 @@ aws ecs update-service --cluster litellm-ecs-cluster \
   --service litellm-litellm-service --force-new-deployment --region us-east-1
 ```
 
-### 5. WAF IP 白名单管理
+### 5. Public ALB WAF IP 白名单管理
 
-提供独立脚本 `manage-waf-ip-whitelist.sh` 管理 WAF IP 白名单，支持 deny-all 模式（仅允许白名单 IP 访问）和 allow-all 模式（默认放行，仅拦截恶意请求）。
+部署 ECS 后，使用独立脚本 `manage-alb-waf.sh` 为 Public ALB 配置 WAF IP 白名单，仅允许指定 IP 访问。
+
+#### 一键设置（推荐）
+
+```bash
+chmod +x manage-alb-waf.sh
+
+# 交互式：输入 IP → 创建 WAF → 绑定 ALB
+./manage-alb-waf.sh setup
+```
+
+脚本会提示输入允许访问的 IP（CIDR 格式，空格分隔），然后自动完成：
+1. 创建 IP Set 并添加 IP
+2. 创建 WAF WebACL（deny-all 模式，仅白名单 + 健康检查放行）
+3. 将 WAF 绑定到 Public ALB
+
+#### 日常管理
+
+```bash
+# 查看白名单
+./manage-alb-waf.sh list
+
+# 添加 IP
+./manage-alb-waf.sh add 203.0.113.0/24 198.51.100.10/32
+
+# 移除 IP
+./manage-alb-waf.sh remove 203.0.113.0/24
+
+# 查看 WAF 完整状态
+./manage-alb-waf.sh status
+```
+
+#### 模式切换
+
+```bash
+# 临时放开所有访问
+./manage-alb-waf.sh mode allow-all
+
+# 恢复白名单限制
+./manage-alb-waf.sh mode deny-all
+```
+
+#### 清理
+
+```bash
+# 删除 WAF 和 IP Set（ALB 恢复无限制访问）
+./manage-alb-waf.sh destroy
+```
+
+#### 命令一览
+
+| 命令 | 说明 |
+|------|------|
+| `setup` | 一键初始化：输入 IP → 创建 WAF → 绑定 ALB |
+| `list` | 查看当前白名单 IP 列表 |
+| `add <ip>...` | 添加 IP 到白名单（CIDR 格式，单 IP 用 /32） |
+| `remove <ip>...` | 从白名单移除 IP |
+| `mode deny-all` | 切换为只允许白名单 IP 访问 |
+| `mode allow-all` | 切换为默认放行 |
+| `bindalb` | 将 WAF 绑定到 ALB |
+| `unbindalb` | 从 ALB 解绑 WAF |
+| `status` | 查看 WAF 完整状态 |
+| `destroy` | 删除 WAF 和 IP Set |
+
+> ⚠️ **注意**：
+> - IP 必须使用 CIDR 格式，单个 IP 使用 `/32`
+> - 此脚本使用 REGIONAL scope WAF（绑定到 ALB），与 CloudFront WAF（CLOUDFRONT scope）互相独立
+> - 健康检查路径 `/health/liveliness` 始终放行（不受 IP 限制）
+
+### 6. CloudFront WAF IP 白名单管理（可选）
+
+提供独立脚本 `manage-waf-ip-whitelist.sh` 管理 CloudFront WAF IP 白名单，支持 deny-all 模式（仅允许白名单 IP 访问）和 allow-all 模式（默认放行，仅拦截恶意请求）。
 
 #### 首次配置
 
@@ -275,6 +352,7 @@ chmod +x manage-waf-ip-whitelist.sh
 |----------|--------|------|
 | `ENVIRONMENT_NAME` | litellm | 资源命名前缀 |
 | `AWS_REGION` | us-east-1 | 部署区域 |
+| `DEPLOY_MODE` | alb | 部署模式：`alb`（Public ALB + WAF）或 `cloudfront`（Internal ALB + CloudFront + WAF） |
 
 ### VPC
 

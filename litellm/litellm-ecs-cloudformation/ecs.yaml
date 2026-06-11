@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  LiteLLM ECS Fargate Service with Internal ALB, Secrets Manager,
+  LiteLLM ECS Fargate Service with Public ALB, Secrets Manager,
   IAM Role-based Bedrock access, config on S3, security best practices.
 
 Parameters:
@@ -199,16 +199,15 @@ Resources:
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group for internal ALB (CloudFront VPC origin)
+      GroupDescription: Security group for public ALB
       VpcId:
         Fn::ImportValue: !Sub ${EnvironmentName}-VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
-          CidrIp:
-            Fn::ImportValue: !Sub ${EnvironmentName}-VpcCIDR
-          Description: Allow HTTP from within VPC
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP from internet
       Tags:
         - Key: Name
           Value: !Sub ${EnvironmentName}-alb-sg
@@ -230,19 +229,19 @@ Resources:
           Value: !Sub ${EnvironmentName}-ecs-sg
 
   #============================================================
-  # Application Load Balancer (Internal)
+  # Application Load Balancer (Internet-facing)
   #============================================================
   ALB:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: !Sub ${EnvironmentName}-int-alb
+      Name: !Sub ${EnvironmentName}-pub-alb
       Type: application
-      Scheme: internal
+      Scheme: internet-facing
       SecurityGroups:
         - !Ref ALBSecurityGroup
       Subnets:
-        - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet1Id
-        - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet2Id
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PublicSubnet1Id
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PublicSubnet2Id
       LoadBalancerAttributes:
         - Key: idle_timeout.timeout_seconds
           Value: '300'
@@ -250,7 +249,7 @@ Resources:
           Value: 'true'
       Tags:
         - Key: Name
-          Value: !Sub ${EnvironmentName}-int-alb
+          Value: !Sub ${EnvironmentName}-pub-alb
 
   ALBTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
@@ -493,25 +492,25 @@ Outputs:
     Value: !GetAtt ECSService.Name
 
   ALBDnsName:
-    Description: Internal ALB DNS name
+    Description: Public ALB DNS name
     Value: !GetAtt ALB.DNSName
     Export:
       Name: !Sub ${EnvironmentName}-ALBDnsName
 
   ALBArn:
-    Description: Internal ALB ARN (for CloudFront VPC origin)
+    Description: Public ALB ARN
     Value: !Ref ALB
     Export:
       Name: !Sub ${EnvironmentName}-ALBArn
 
   ALBSecurityGroupId:
-    Description: ALB Security Group ID (add CloudFront VPC Origin SG after deploying cloudfront-waf.yaml)
+    Description: ALB Security Group ID
     Value: !Ref ALBSecurityGroup
     Export:
       Name: !Sub ${EnvironmentName}-ALBSecurityGroupId
 
   ALBUrl:
-    Description: LiteLLM internal URL
+    Description: LiteLLM public URL
     Value: !Sub "http://${ALB.DNSName}"
 
   MasterKeySecretArn:
