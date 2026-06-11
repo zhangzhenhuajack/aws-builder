@@ -482,18 +482,33 @@ API Error: The socket connection was closed unexpectedly. For more information, 
 Claude Code ──▶ CloudFront (OriginReadTimeout) ──▶ ALB (idle_timeout) ──▶ ECS/LiteLLM ──▶ Bedrock
 ```
 
-**当前配置**（已优化）：
+**当前配置**：
 
 | 组件 | 参数 | 值 | 说明 |
 |------|------|-----|------|
-| CloudFront | OriginReadTimeout | 180s | CloudFront 最大值 |
-| CloudFront | OriginKeepaliveTimeout | 60s | 保持长连接复用 |
-| ALB | idle_timeout | 300s | 必须 > CloudFront timeout |
+| CloudFront | OriginReadTimeout | 120s | **包间隔 idle 超时**（两次字节之间），不是总时长；每收到一个包就重置 |
+| CloudFront | OriginKeepaliveTimeout | 60s | 响应**结束后**连接复用的留存时间，与流式中途断连无关 |
+| ALB | idle_timeout | 300s | 同样被数据字节重置；> 心跳间隔即可 |
 
-**如果 180s 仍不够**（CloudFront 硬限制）：
+> **关于 OriginReadTimeout 的上限**：它**不是** 180s 硬顶。默认 30s，本模板设为 120s；可经自助工具进一步调高，约束是 MTOW = ConnectionAttempts × OriginReadTimeout ≤ 540s（即单值最高可到 540s，需把 Connection Attempts 设为 1）。**但调大固定值始终治标**——长思考的静默 gap 可能超过任何固定上限。
 
-1. **绕过 CloudFront 直连 ALB** — 将 ALB 改为 Internet-facing，Claude Code 的 `ANTHROPIC_BASE_URL` 直接指向 ALB 地址，ALB idle timeout 可设到 4000s
-2. **确认 streaming 正常** — 检查 LiteLLM 是否正确将 `stream: true` 传递给 Bedrock，streaming 模式下只要第一个 token 在 180s 内返回就不会超时
+**根治方案：SSE 心跳 sidecar（推荐）**
+
+`OriginReadTimeout` 是"两次字节之间"的 idle 超时，只要源站在静默期持续发字节就永远不会触发。本项目提供一个轻量 sidecar（`sse-heartbeat-proxy/`），在同一个 ECS Task 内反代 LiteLLM，在 SSE 流空闲时每 15s 注入一行 `: keepalive` 注释，喂活 CloudFront / ALB 的所有 idle 计时器，**让思考 gap 可以无限长**，无需调高任何超时、也保留 CloudFront + WAF。
+
+启用方式（需本地有 Docker）：
+
+```bash
+ENABLE_SIDECAR=true ./deploy.sh deploy-ecs
+```
+
+这会自动构建镜像并推到 ECR、把 ALB target 切到 sidecar（:8080 → LiteLLM :4000）。不加 `ENABLE_SIDECAR` 则维持 ALB 直连 LiteLLM 的原行为。
+
+**心跳 sidecar 覆盖不到的，需另行确认：**
+
+1. **上游 Bedrock 超时**（必配，否则心跳白搭）— botocore 默认 `read_timeout` 仅 60s，长思考必被上游主动 abort。`litellm_config.yaml` 已为各模型设 `timeout: 900` + 全局 `request_timeout: 900`。
+2. **CloudFront Response Completion Timeout** — 这是个独立的"总时长硬顶"，心跳盖不住；默认不设（无上限），确认没人在 distribution 上手动配过即可。
+3. **SearXNG / 服务端 web-search** — 若启用了 LiteLLM 的服务端检索（`SEARXNG_API_BASE`），那条请求会被 LiteLLM 内部**降级成非流式**（一个完整 JSON），没有 SSE 流可插心跳，心跳救不了它。这类路径只能调大 `OriginReadTimeout`（≤540s）来硬扛，或改用网关层方案（如 Envoy Gateway）。
 
 ### CloudFront 访问返回 504 Gateway Timeout
 

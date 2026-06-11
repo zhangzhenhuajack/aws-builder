@@ -39,6 +39,29 @@ Parameters:
     Default: 4000
     Description: Container port for LiteLLM
 
+  SidecarImage:
+    Type: String
+    Default: ''
+    Description: >
+      SSE heartbeat proxy sidecar image URI (ECR). Leave empty to disable the
+      sidecar — the ALB then targets LiteLLM directly (original behavior).
+      When set, ALB targets the sidecar on 8080, which proxies to LiteLLM on
+      127.0.0.1:4000 and injects SSE keepalive bytes during long-thinking
+      silences so CloudFront's origin Response timeout doesn't cut the stream.
+
+  HeartbeatInterval:
+    Type: Number
+    Default: 15
+    Description: Seconds between SSE keepalive injections (must be < CloudFront OriginReadTimeout)
+
+  SidecarPort:
+    Type: Number
+    Default: 8080
+    Description: Port the heartbeat sidecar listens on (ALB target when sidecar is enabled)
+
+Conditions:
+  HasSidecar: !Not [!Equals [!Ref SidecarImage, '']]
+
 Resources:
   #============================================================
   # Secrets Manager - LiteLLM Master Key
@@ -220,9 +243,11 @@ Resources:
       VpcId:
         Fn::ImportValue: !Sub ${EnvironmentName}-VpcId
       SecurityGroupIngress:
+        # ALB → sidecar port (8080) when the heartbeat sidecar is enabled,
+        # otherwise ALB → LiteLLM port (4000) directly.
         - IpProtocol: tcp
-          FromPort: !Ref ContainerPort
-          ToPort: !Ref ContainerPort
+          FromPort: !If [HasSidecar, !Ref SidecarPort, !Ref ContainerPort]
+          ToPort: !If [HasSidecar, !Ref SidecarPort, !Ref ContainerPort]
           SourceSecurityGroupId: !Ref ALBSecurityGroup
           Description: Allow traffic from ALB only
       Tags:
@@ -244,8 +269,16 @@ Resources:
         - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet1Id
         - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet2Id
       LoadBalancerAttributes:
+        # Idle timeout: reset by data bytes, so the ~15s SSE heartbeat keeps it
+        # alive. 300 is well above the heartbeat interval (must not drop near it).
         - Key: idle_timeout.timeout_seconds
           Value: '300'
+        # Max lifetime of a single client<->ALB connection regardless of
+        # activity. Default 3600s would gracefully close a stream running past
+        # 1h. Our streams cap at request_timeout=900s, so 3600 is safe — set
+        # explicitly to document the ceiling and avoid surprise if raised later.
+        - Key: client_keep_alive.seconds
+          Value: '3600'
         - Key: routing.http.drop_invalid_header_fields.enabled
           Value: 'true'
       Tags:
@@ -256,7 +289,9 @@ Resources:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
       Name: !Sub ${EnvironmentName}-ecs-tg
-      Port: !Ref ContainerPort
+      # Target the sidecar (8080) when enabled, else LiteLLM (4000) directly.
+      # The sidecar passes /health/liveliness straight through to LiteLLM.
+      Port: !If [HasSidecar, !Ref SidecarPort, !Ref ContainerPort]
       Protocol: HTTP
       VpcId:
         Fn::ImportValue: !Sub ${EnvironmentName}-VpcId
@@ -267,8 +302,15 @@ Resources:
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 5
       TargetGroupAttributes:
+        # During a deploy/scale-in the task enters DEACTIVATING and keeps
+        # serving in-flight requests for up to this long (ALB draining) BEFORE
+        # ECS sends SIGTERM — so an in-flight extended-thinking stream finishes
+        # cleanly. 3600 is the ALB hard max (range 0-3600; 3900 would be
+        # REJECTED at deploy time). Our streams cap at request_timeout=900s, so
+        # 3600 leaves ample headroom; after draining the 120s stopTimeout
+        # (Fargate hard max) is plenty since the container is then idle.
         - Key: deregistration_delay.timeout_seconds
-          Value: '60'
+          Value: '3600'
 
   ALBListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -398,6 +440,50 @@ Resources:
             Timeout: 10
             Retries: 5
             StartPeriod: 120
+          # Grace period after SIGTERM before SIGKILL. 120 is the Fargate hard
+          # max. By the time SIGTERM is sent the ALB has already drained
+          # (deregistration_delay), so in-flight streams are done and the
+          # container just needs a clean exit.
+          StopTimeout: 120
+
+        # SSE heartbeat proxy sidecar (only injected when SidecarImage is set).
+        # ALB → :8080 (this) → LiteLLM 127.0.0.1:4000. Injects ": keepalive"
+        # during long-thinking silences so CloudFront's idle timeout doesn't cut
+        # the stream. Zero changes to LiteLLM itself.
+        - !If
+          - HasSidecar
+          - Name: sse-heartbeat
+            Image: !Ref SidecarImage
+            Essential: true
+            DependsOn:
+              - ContainerName: litellm
+                Condition: HEALTHY
+            PortMappings:
+              - ContainerPort: !Ref SidecarPort
+                Protocol: tcp
+            Environment:
+              - Name: UPSTREAM_BASE
+                Value: !Sub "http://127.0.0.1:${ContainerPort}"
+              - Name: LISTEN_PORT
+                Value: !Ref SidecarPort
+              - Name: HEARTBEAT_INTERVAL
+                Value: !Ref HeartbeatInterval
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref LogGroup
+                awslogs-region: !Ref AWS::Region
+                awslogs-stream-prefix: sse-heartbeat
+            HealthCheck:
+              Command:
+                - CMD-SHELL
+                - !Sub "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:${SidecarPort}/health/liveliness\")' || exit 1"
+              Interval: 30
+              Timeout: 10
+              Retries: 5
+              StartPeriod: 120
+            StopTimeout: 120  # Fargate hard max; ALB has drained before SIGTERM
+          - !Ref AWS::NoValue
       Volumes:
         - Name: config-volume
       Tags:
@@ -426,8 +512,9 @@ Resources:
             - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet1Id
             - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet2Id
       LoadBalancers:
-        - ContainerName: litellm
-          ContainerPort: !Ref ContainerPort
+        # Point the ALB at the sidecar container when enabled, else LiteLLM.
+        - ContainerName: !If [HasSidecar, sse-heartbeat, litellm]
+          ContainerPort: !If [HasSidecar, !Ref SidecarPort, !Ref ContainerPort]
           TargetGroupArn: !Ref ALBTargetGroup
       DeploymentConfiguration:
         MinimumHealthyPercent: 50

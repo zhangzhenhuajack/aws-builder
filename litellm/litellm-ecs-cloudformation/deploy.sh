@@ -37,6 +37,16 @@ TASK_MEMORY="${TASK_MEMORY:-4096}"
 DESIRED_COUNT="${DESIRED_COUNT:-2}"
 SEARXNG_API_BASE="${SEARXNG_API_BASE:-}"
 
+# SSE heartbeat sidecar (optional). When ENABLE_SIDECAR=true, deploy-ecs first
+# builds & pushes the sidecar image to ECR, then passes its URI to the stack so
+# the ALB targets the sidecar instead of LiteLLM directly. Leave disabled to
+# keep the original direct-to-LiteLLM behavior.
+ENABLE_SIDECAR="${ENABLE_SIDECAR:-false}"
+SIDECAR_ECR_REPO="${SIDECAR_ECR_REPO:-${ENVIRONMENT_NAME}-sse-heartbeat}"
+SIDECAR_IMAGE_TAG="${SIDECAR_IMAGE_TAG:-latest}"
+SIDECAR_IMAGE="${SIDECAR_IMAGE:-}"  # auto-filled by build_sidecar when ENABLE_SIDECAR=true
+HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-15}"
+
 # Bedrock Configuration
 BEDROCK_STACK_NAME="${BEDROCK_STACK_NAME:-litellm-bedrock}"
 
@@ -325,6 +335,41 @@ upload_config() {
 }
 
 #============================================================
+# SSE Heartbeat Sidecar - build & push to ECR
+#============================================================
+build_sidecar() {
+    local account_id
+    account_id=$(aws sts get-caller-identity --query Account --output text)
+    local registry="${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    SIDECAR_IMAGE="${registry}/${SIDECAR_ECR_REPO}:${SIDECAR_IMAGE_TAG}"
+
+    log_info "Building SSE heartbeat sidecar image: ${SIDECAR_IMAGE}"
+
+    if ! command -v docker &> /dev/null; then
+        log_error "docker is required to build the sidecar (ENABLE_SIDECAR=true)."
+        exit 1
+    fi
+
+    # Create ECR repo if absent (idempotent).
+    aws ecr describe-repositories --repository-names "${SIDECAR_ECR_REPO}" --region "${AWS_REGION}" &> /dev/null || {
+        log_info "Creating ECR repository: ${SIDECAR_ECR_REPO}"
+        aws ecr create-repository --repository-name "${SIDECAR_ECR_REPO}" \
+            --image-scanning-configuration scanOnPush=true \
+            --region "${AWS_REGION}" > /dev/null
+    }
+
+    log_info "Logging in to ECR registry ${registry}"
+    aws ecr get-login-password --region "${AWS_REGION}" \
+        | docker login --username AWS --password-stdin "${registry}" > /dev/null
+
+    # linux/amd64 to match Fargate (build host may be arm64, e.g. Apple Silicon).
+    docker build --platform linux/amd64 -t "${SIDECAR_IMAGE}" ./sse-heartbeat-proxy
+    docker push "${SIDECAR_IMAGE}"
+
+    log_info "Sidecar image pushed: ${SIDECAR_IMAGE}"
+}
+
+#============================================================
 # ECS Deployment
 #============================================================
 deploy_ecs() {
@@ -336,10 +381,20 @@ deploy_ecs() {
         LITELLM_IMAGE="${input_image}"
     fi
 
+    # Build & push the heartbeat sidecar first if enabled (sets SIDECAR_IMAGE).
+    if [[ "${ENABLE_SIDECAR}" == "true" ]]; then
+        build_sidecar
+    fi
+
     log_info "Deploying ECS stack: ${ECS_STACK_NAME} in region: ${AWS_REGION}"
     log_info "Image: ${LITELLM_IMAGE}"
     log_info "CPU: ${TASK_CPU} units, Memory: ${TASK_MEMORY} MB"
     log_info "Desired count: ${DESIRED_COUNT}"
+    if [[ -n "${SIDECAR_IMAGE}" ]]; then
+        log_info "SSE heartbeat sidecar: ENABLED (${SIDECAR_IMAGE}, interval=${HEARTBEAT_INTERVAL}s)"
+    else
+        log_info "SSE heartbeat sidecar: disabled (ALB targets LiteLLM directly)"
+    fi
 
     validate_template "ecs.yaml"
 
@@ -355,6 +410,8 @@ deploy_ecs() {
             TaskMemory="${TASK_MEMORY}" \
             DesiredCount="${DESIRED_COUNT}" \
             SearxngApiBase="${SEARXNG_API_BASE}" \
+            SidecarImage="${SIDECAR_IMAGE}" \
+            HeartbeatInterval="${HEARTBEAT_INTERVAL}" \
         --tags \
             "Project=litellm" \
             "Environment=${ENVIRONMENT_NAME}" \
