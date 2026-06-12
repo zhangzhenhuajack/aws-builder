@@ -1,4 +1,6 @@
-FROM python:3.12-slim
+# ECR Public mirror of Docker Hub's official python image — avoids Docker Hub's
+# unauthenticated pull rate limit (429) that hits shared CodeBuild egress IPs.
+FROM public.ecr.aws/docker/library/python:3.12-slim
 
 WORKDIR /app
 
