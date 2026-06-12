@@ -283,18 +283,22 @@ deploy_bedrock() {
 upload_mantle_key() {
     log_info "Uploading Bedrock Mantle API Key to Secrets Manager..."
 
+    # Optional: the Mantle key is only needed for the gpt-5.x models. Deploying
+    # the service has nothing to do with which AI client (Codex/Claude/Kiro/none)
+    # is installed locally, so a missing key must NOT abort the deploy — it just
+    # leaves the gpt models unusable (Claude/Bedrock models are unaffected).
+    # Source order: env var first (CI/anyone can pass it), then ~/.codex/.env as
+    # a convenience fallback, otherwise warn and skip.
+    local api_key="${BEDROCK_MANTLE_API_KEY:-}"
     local env_file="${HOME}/.codex/.env"
-    if [[ ! -f "${env_file}" ]]; then
-        log_error "File not found: ${env_file}"
-        exit 1
+    if [[ -z "${api_key}" && -f "${env_file}" ]]; then
+        api_key=$(grep '^AWS_BEARER_TOKEN_BEDROCK=' "${env_file}" | cut -d'=' -f2-)
     fi
 
-    local api_key
-    api_key=$(grep '^AWS_BEARER_TOKEN_BEDROCK=' "${env_file}" | cut -d'=' -f2-)
-
     if [[ -z "${api_key}" ]]; then
-        log_error "AWS_BEARER_TOKEN_BEDROCK not found in ${env_file}"
-        exit 1
+        log_warn "No Bedrock Mantle API key found (set BEDROCK_MANTLE_API_KEY or put AWS_BEARER_TOKEN_BEDROCK in ${env_file})."
+        log_warn "Skipping — gpt-5.x models will be unavailable; Claude/Bedrock models work normally."
+        return 0
     fi
 
     local secret_id="${ENVIRONMENT_NAME}/litellm/bedrock-mantle-api-key"
