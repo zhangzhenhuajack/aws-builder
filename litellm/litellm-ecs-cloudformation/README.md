@@ -53,6 +53,7 @@
 | `ecs.yaml` | litellm-ecs | ECS Fargate + Internal ALB + Auto Scaling |
 | `cloudfront-waf.yaml` | litellm-cloudfront | CloudFront + WAF（可选） |
 | `litellm_config.yaml` | - | LiteLLM 应用配置（上传到 S3） |
+| `sse-heartbeat-proxy/` | - | SSE 心跳 sidecar（可选，解决长思考流式断连，见故障排查） |
 | `deploy.sh` | - | 一键部署脚本 |
 | `manage-waf-ip-whitelist.sh` | - | WAF IP 白名单管理脚本 |
 
@@ -301,6 +302,9 @@ chmod +x manage-waf-ip-whitelist.sh
 | `TASK_CPU` | 2048 | CPU 单位 (2 vCPU) |
 | `TASK_MEMORY` | 4096 | 内存 (4 GB) |
 | `DESIRED_COUNT` | 2 | 期望副本数 |
+| `ENABLE_SIDECAR` | false | 是否启用 SSE 心跳 sidecar（见故障排查「长任务 socket closed」） |
+| `SIDECAR_BUILD` | codebuild | sidecar 镜像构建方式：`codebuild`（云端，无需本地 Docker）或 `docker`（本地构建） |
+| `HEARTBEAT_INTERVAL` | 15 | 心跳注入间隔（秒），需 < OriginReadTimeout |
 
 ### CloudFront
 
@@ -486,29 +490,40 @@ Claude Code ──▶ CloudFront (OriginReadTimeout) ──▶ ALB (idle_timeout
 
 | 组件 | 参数 | 值 | 说明 |
 |------|------|-----|------|
-| CloudFront | OriginReadTimeout | 120s | **包间隔 idle 超时**（两次字节之间），不是总时长；每收到一个包就重置 |
+| CloudFront | OriginReadTimeout | 120s | **包间隔 idle 超时**（既是"等首字节"也是"两次字节之间"），不是总时长；每收到一个包就重置 |
 | CloudFront | OriginKeepaliveTimeout | 60s | 响应**结束后**连接复用的留存时间，与流式中途断连无关 |
 | ALB | idle_timeout | 300s | 同样被数据字节重置；> 心跳间隔即可 |
 
-> **关于 OriginReadTimeout 的上限**：它**不是** 180s 硬顶。默认 30s，本模板设为 120s；可经自助工具进一步调高，约束是 MTOW = ConnectionAttempts × OriginReadTimeout ≤ 540s（即单值最高可到 540s，需把 Connection Attempts 设为 1）。**但调大固定值始终治标**——长思考的静默 gap 可能超过任何固定上限。
+> **关于 OriginReadTimeout**：默认 30s，本模板设为 120s。它是一个"包间隔 idle 超时"——既覆盖"发出请求后等首字节（含响应头）"，也覆盖"流式开始后两次字节之间"，每收到一个包就重置。可按 AWS 官方文档允许的方式申请提高，但**调大固定值始终治标**——长思考的静默 gap 可能超过任何固定上限。真正的解法是让源站在静默期持续发字节（见下方心跳 sidecar）。
 
 **根治方案：SSE 心跳 sidecar（推荐）**
 
-`OriginReadTimeout` 是"两次字节之间"的 idle 超时，只要源站在静默期持续发字节就永远不会触发。本项目提供一个轻量 sidecar（`sse-heartbeat-proxy/`），在同一个 ECS Task 内反代 LiteLLM，在 SSE 流空闲时每 15s 注入一行 `: keepalive` 注释，喂活 CloudFront / ALB 的所有 idle 计时器，**让思考 gap 可以无限长**，无需调高任何超时、也保留 CloudFront + WAF。
+`OriginReadTimeout` 是 idle 超时，只要源站在静默期持续发字节就永远不会触发。本项目提供一个轻量 sidecar（`sse-heartbeat-proxy/`），在同一个 ECS Task 内反代 LiteLLM，对流式请求**立即向客户端发出 200 + SSE 响应头并开始心跳**（不等 LiteLLM 的首 token），随后在 SSE 流空闲时每 15s 注入一行 `: keepalive` 注释。这样既盖住"首 token 之前的静默"（LiteLLM 把 200 响应头压到首 token 才发，长思考时这段静默可达数十秒），也盖住"思考 token 之间的 gap"，**让思考 gap 可以无限长**，无需调高任何超时、也保留 CloudFront + WAF。非流式请求保持原样透传（正确返回上游状态码）。
 
-启用方式（需本地有 Docker）：
+启用方式：
 
 ```bash
 ENABLE_SIDECAR=true ./deploy.sh deploy-ecs
 ```
 
-这会自动构建镜像并推到 ECR、把 ALB target 切到 sidecar（:8080 → LiteLLM :4000）。不加 `ENABLE_SIDECAR` 则维持 ALB 直连 LiteLLM 的原行为。
+这会自动构建 sidecar 镜像并推到 ECR、把 ALB target 切到 sidecar（:8080 → LiteLLM :4000）。不加 `ENABLE_SIDECAR` 则维持 ALB 直连 LiteLLM 的原行为。
+
+**镜像构建方式（`SIDECAR_BUILD`）**：
+
+| 值 | 说明 |
+|----|------|
+| `codebuild`（默认） | 云端构建，**本地无需 Docker**：打包 `sse-heartbeat-proxy/` 上传到 S3 栈的桶，由 CodeBuild 构建并推到 ECR。适合没有 Docker 的环境。 |
+| `docker` | 本地 `docker build` 构建（需本机有可用的 Docker daemon）。 |
+
+```bash
+SIDECAR_BUILD=docker ENABLE_SIDECAR=true ./deploy.sh deploy-ecs   # 显式用本地 docker
+```
 
 **心跳 sidecar 覆盖不到的，需另行确认：**
 
-1. **上游 Bedrock 超时**（必配，否则心跳白搭）— botocore 默认 `read_timeout` 仅 60s，长思考必被上游主动 abort。`litellm_config.yaml` 已为各模型设 `timeout: 900` + 全局 `request_timeout: 900`。
+1. **上游读超时**（必配）— LiteLLM 的 Bedrock 流式调用走 httpx（**不是 boto3**），由 `timeout` 控制读超时；不设时 httpx 默认回退到 600s。`litellm_config.yaml` 已为各模型设 `timeout: 900` + 全局 `request_timeout: 900`，足够覆盖长思考。
 2. **CloudFront Response Completion Timeout** — 这是个独立的"总时长硬顶"，心跳盖不住；默认不设（无上限），确认没人在 distribution 上手动配过即可。
-3. **SearXNG / 服务端 web-search** — 若启用了 LiteLLM 的服务端检索（`SEARXNG_API_BASE`），那条请求会被 LiteLLM 内部**降级成非流式**（一个完整 JSON），没有 SSE 流可插心跳，心跳救不了它。这类路径只能调大 `OriginReadTimeout`（≤540s）来硬扛，或改用网关层方案（如 Envoy Gateway）。
+3. **SearXNG / 服务端 web-search** — 若启用了 LiteLLM 的服务端检索（`SEARXNG_API_BASE`），那条请求会被 LiteLLM 内部**降级成非流式**（一个完整 JSON），没有 SSE 流可插心跳，心跳救不了它。这类路径只能调高 `OriginReadTimeout` 来硬扛，或改用网关层方案（如 Envoy Gateway）。
 
 ### CloudFront 访问返回 504 Gateway Timeout
 
