@@ -312,11 +312,28 @@ upload_config() {
 
     log_info "Config uploaded successfully!"
 
+    # Check if ECS service exists before triggering redeployment
+    local cluster_name="${ENVIRONMENT_NAME}-ecs-cluster"
+    local service_name="${ENVIRONMENT_NAME}-${ENVIRONMENT_NAME}-service"
+    local service_status
+    service_status=$(aws ecs describe-services \
+        --cluster "${cluster_name}" \
+        --services "${service_name}" \
+        --region "${AWS_REGION}" \
+        --query 'services[0].status' \
+        --output text 2>/dev/null || echo "MISSING")
+
+    if [[ "${service_status}" != "ACTIVE" ]]; then
+        log_warn "ECS service ${service_name} not found or not ACTIVE (status: ${service_status}). Skipping force new deployment."
+        log_warn "Run './deploy.sh deploy-ecs' first, or trigger redeployment manually after ECS is up."
+        return 0
+    fi
+
     # Force ECS redeployment to load new config
     log_info "Triggering ECS force new deployment..."
     aws ecs update-service \
-        --cluster "${ENVIRONMENT_NAME}-ecs-cluster" \
-        --service "${ENVIRONMENT_NAME}-${ENVIRONMENT_NAME}-service" \
+        --cluster "${cluster_name}" \
+        --service "${service_name}" \
         --force-new-deployment \
         --region "${AWS_REGION}" \
         --query 'service.{status:status,desiredCount:desiredCount}' \
