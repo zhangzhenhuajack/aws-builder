@@ -428,8 +428,8 @@ deploy_all() {
     deploy_s3
     deploy_database
     deploy_bedrock
-    upload_config
     deploy_ecs
+    upload_config
     upload_mantle_key
     deploy_cloudfront
     log_info "All stacks deployed successfully!"
