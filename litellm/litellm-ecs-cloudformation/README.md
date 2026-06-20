@@ -775,8 +775,8 @@ CloudWatch Logs ──▶ Subscription Filter ──▶ Lambda ──▶ SNS 告
 
 | 文档 | 说明 |
 |------|------|
-| [Claude Code & Desktop 接入](./claude-code-desktop-litellm-bedrock.md) | Claude Code 和 Claude Desktop 通过 LiteLLM 调用 Bedrock |
-| [OpenAI Codex 接入](./openai-codex-litellm-bedrock.md) | OpenAI Codex CLI/App 通过 LiteLLM 调用 Bedrock |
+| [Claude Code & Desktop 接入](../claude-code-desktop-litellm-bedrock.md) | Claude Code 和 Claude Desktop 通过 LiteLLM 调用 Bedrock |
+| [OpenAI Codex 接入](../openai-codex-litellm-bedrock.md) | OpenAI Codex CLI/App 通过 LiteLLM 调用 Bedrock |
 ｜Cursor/ClaudeCode（含Desktop）对接Bedrock（使用Claude模型）｜https://aws.amazon.com/cn/blogs/china/claude-cowork-amazon-bedrock-configuration-practice/｜
 ## 参考资料
 1. litellm logging的其他存储方式：https://docs.litellm.ai/docs/proxy/logging

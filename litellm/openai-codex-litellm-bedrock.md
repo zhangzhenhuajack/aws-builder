@@ -39,11 +39,11 @@ LiteLLM Proxy (ECS Fargate)
 
 在 LiteLLM UI 中编辑目标模型，添加以下配置：
 
-![编辑模型 - Additional Drop Params](./litellm-edite-model-additional-drop-params.png)
+![编辑模型 - Additional Drop Params](./litellm-ecs-cloudformation/litellm-edite-model-additional-drop-params.png)
 
 在 Model Info 中设置：
 
-![编辑 Model Info](./blog7-edit-model-info.png)
+![编辑 Model Info](./litellm-ecs-cloudformation/blog7-edit-model-info.png)
 
 ```yaml
 "drop_params": true,
@@ -129,13 +129,13 @@ codex --model bedrock-claude-opus-4-6-v1 "create a hello world python script"
 codex --model bedrock-claude-opus-4-7 --full-auto "refactor this file to use async/await"
 ```
 
-![Codex CLI 使用 Claude 模型](./codex-cli-anthropic-claude-model.png)
+![Codex CLI 使用 Claude 模型](./litellm-ecs-cloudformation/codex-cli-anthropic-claude-model.png)
 
 ### Codex App 桌面端
 
 安装后直接启动即可，会自动读取 `~/.codex/config.toml` 中的 LiteLLM 配置。
 
-![Codex App 使用 Claude 模型](./codeapp-claudemodel.png)
+![Codex App 使用 Claude 模型](./litellm-ecs-cloudformation/codeapp-claudemodel.png)
 
 ---
 
@@ -147,7 +147,7 @@ codex --model bedrock-claude-opus-4-7 --full-auto "refactor this file to use asy
 | Codex 连接超时 | base_url 配置错误或网络不通 | 检查 `config.toml` 中的 `base_url`，确认能 curl 通 `/health` |
 | 模型不存在 | config.toml 中的 model 未在 LiteLLM 注册 | 在 LiteLLM UI 确认模型已添加，名称一致 |
 
-![Codex 修改模型参数配置](./litellm-config-change-model-param.png)
+![Codex 修改模型参数配置](./litellm-ecs-cloudformation/litellm-config-change-model-param.png)
 
 ---
 
@@ -155,7 +155,7 @@ codex --model bedrock-claude-opus-4-7 --full-auto "refactor this file to use asy
 
 除了 Codex 直连 Bedrock 外，也可以通过 LiteLLM 代理统一接入 GPT-5.5 和 GPT-5.4，获得费用追踪、审计日志和多模型管理能力。
 
-![Bedrock GPT-5.5 通过 LiteLLM](./Bedrock-GPT5.5-Litellm.png)
+![Bedrock GPT-5.5 通过 LiteLLM](./litellm-ecs-cloudformation/Bedrock-GPT5.5-Litellm.png)
 
 ### 7.1 LiteLLM 配置文件添加模型
 
@@ -315,12 +315,15 @@ curl -s https://<your-litellm-domain>/chat/completions \
 ### 8.1 配置 `~/.codex/config.toml`
 
 ```toml
-model = "openai.gpt-5.5"
 model_provider = "amazon-bedrock"
+model = "openai.gpt-5.5"
+model_reasoning_effort = "medium"   # 推理强度：low / medium / high / extra-high（可选，默认 medium）
 
 [model_providers.amazon-bedrock.aws]
 region = "us-east-2"
 ```
+
+> 💡 `model_reasoning_effort` 是可选参数，省略后取默认值 `medium`。如果只想最简上手，删掉这一行也能直接跑。
 
 ### 8.2 配置 `~/.codex/.env`
 
@@ -332,14 +335,42 @@ AWS_BEARER_TOKEN_BEDROCK=bedrock-api-key-<your-presigned-token>
 
 > **Token 获取方式**：通过 AWS Console 的 Bedrock 页面生成 API Key（Presigned URL 形式），有效期 12 小时。
 
-### 8.3 使用
+### 8.3 Reasoning Effort 与运行时切换
+
+Codex 在调用 Bedrock 上的 GPT-5.5 / GPT-5.4 时支持四档推理强度，既可以在 `config.toml` 中通过 `model_reasoning_effort` 静态指定，也可以在 Codex App / CLI 运行时动态切换 —— 无需重启或改文件。
+
+| 等级 | 适用场景 |
+|------|----------|
+| `low` | 简单问答、补全、日志解释 |
+| `medium`（默认） | 日常编码、单文件改动 |
+| `high` | 复杂重构、跨文件分析、调试 |
+| `extra-high` | 深度推理、架构设计、长链思考 |
+
+**Codex App** 右下角的下拉菜单同时提供 **模型切换（GPT-5.5 / GPT-5.4）** 和 **Reasoning effort 切换** 两个维度，可以在对话中途随意调档（例如把简单提问降到 `low` 节省 token，把架构问题升到 `extra-high`）。
+
+**Codex CLI** 同样支持运行时覆盖：
+
+```bash
+# 单次调用临时调到 high
+codex --model openai.gpt-5.5 --reasoning-effort high "重构这个模块为状态机"
+```
+
+### 8.4 使用
 
 ```bash
 # 直接使用 Bedrock 上的 GPT-5.5
 codex "explain this codebase"
 ```
 
-### 8.4 两种方式对比
+> ⚠️ **OpenAI 区域限制提示**：即使通过 Bedrock 调用 GPT-5.5，部分由 OpenAI 托管的能力（如 Web 浏览/实时检索）仍会校验请求来源地区。在不受支持的区域使用时可能遇到下面这个报错：
+>
+> ```
+> Access to OpenAI models is not allowed from unsupported countries, regions, or territories.
+> ```
+>
+> 这种情况下，**纯本地代码能力（编辑、运行命令、读写文件）依然可用**，只是涉及 OpenAI 在线检索的工具会被拒绝。详见 [OpenAI 支持的国家与地区列表](https://help.openai.com/en/articles/5347006-openai-api-supported-countries-and-territories)。
+
+### 8.5 两种方式对比
 
 | 对比项 | ⭐ 直连 Bedrock（推荐） | 通过 LiteLLM |
 |--------|-------------|-------------|

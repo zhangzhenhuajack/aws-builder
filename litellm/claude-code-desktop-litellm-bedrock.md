@@ -48,7 +48,7 @@ curl https://litellm-ui.<your-domain>.com/v1/messages \
 
 在 LiteLLM UI 中配置好 Bedrock 上的 Claude 模型（Opus / Sonnet / Haiku 等）：
 
-![litellm models](./litellm-models.png)
+![litellm models](./litellm-ecs-cloudformation/litellm-models.png)
 
 ### 2. 配置环境变量
 
@@ -96,13 +96,13 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-bedrock-haiku
 
 实际调用截图（Claude Code 通过 LiteLLM 走 Bedrock 链路）：
 
-![claude code 调用案例](./claude-code.png)
+![claude code 调用案例](./litellm-ecs-cloudformation/claude-code.png)
 
 #### LiteLLM 全链路日志追踪
 
 通过 LiteLLM 的请求日志，可以清晰地看到 Claude Code 每一次调用的完整过程 —— 包括请求参数、模型路由、tool use、token 用量、耗时等，对**学习和分析 Claude Code 的工作机制非常有帮助**：
 
-![claude code 调用日志](./claude-log-trace.png)
+![claude code 调用日志](./litellm-ecs-cloudformation/claude-log-trace.png)
 
 借助这些日志，可以观察到：
 
@@ -121,13 +121,13 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-bedrock-haiku
 
 在 Claude Desktop 中开启 Debug / Developer 模式，使其支持自定义 endpoint：
 
-![claude desktop debug](./claude-enable-debuger.png)
+![claude desktop debug](./litellm-ecs-cloudformation/claude-enable-debuger.png)
 
 ### 2. 在桌面端选择 LiteLLM 上的模型
 
 开启 Debug 模式后，Claude Desktop 会通过 LiteLLM 连接到所有已注册的模型，可在下拉框中直接切换：
 
-![claude desktop with litellm](images/claude-desktop-litellm.jpeg)
+![claude desktop with litellm](./litellm-ecs-cloudformation/claude-desktop-litellm.jpeg)
 
 ---
 
