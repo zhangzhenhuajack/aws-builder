@@ -126,6 +126,12 @@ Resources:
               Fn::ImportValue: !Sub ${EnvironmentName}-ALBDnsName
             VpcOriginConfig:
               VpcOriginId: !GetAtt CloudFrontVpcOrigin.Id
+              # Idle (packet-interval) timeout. With the SSE heartbeat sidecar
+              # the origin never goes silent longer than HeartbeatInterval, so
+              # 120 is plenty — the heartbeat (not a high value here) is what
+              # lets thinking gaps exceed any fixed timeout. Self-service can
+              # raise this up to 540 (MTOW = ConnectionAttempts x timeout <=
+              # 540) if you must run WITHOUT the sidecar.
               OriginReadTimeout: 120
               OriginKeepaliveTimeout: 60
 
@@ -146,7 +152,9 @@ Resources:
             - HEAD
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
           OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # AllViewer
-          Compress: true
+          # Must be false for SSE: compression makes CloudFront buffer the
+          # response to compute Content-Length, which breaks streaming delivery.
+          Compress: false
 
       Tags:
         - Key: Name

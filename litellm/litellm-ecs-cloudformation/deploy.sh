@@ -37,6 +37,23 @@ TASK_MEMORY="${TASK_MEMORY:-4096}"
 DESIRED_COUNT="${DESIRED_COUNT:-2}"
 SEARXNG_API_BASE="${SEARXNG_API_BASE:-}"
 
+# SSE heartbeat sidecar (optional). When ENABLE_SIDECAR=true, deploy-ecs first
+# builds & pushes the sidecar image to ECR, then passes its URI to the stack so
+# the ALB targets the sidecar instead of LiteLLM directly. Leave disabled to
+# keep the original direct-to-LiteLLM behavior.
+ENABLE_SIDECAR="${ENABLE_SIDECAR:-false}"
+SIDECAR_ECR_REPO="${SIDECAR_ECR_REPO:-${ENVIRONMENT_NAME}-sse-heartbeat}"
+SIDECAR_IMAGE_TAG="${SIDECAR_IMAGE_TAG:-latest}"
+SIDECAR_IMAGE="${SIDECAR_IMAGE:-}"  # auto-filled by build_sidecar when ENABLE_SIDECAR=true
+HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-15}"
+# Sidecar build backend: "codebuild" (cloud build, no local Docker needed) or
+# "docker" (legacy local build). CodeBuild is the default so teammates without
+# a Docker license can deploy — it zips ./sse-heartbeat-proxy, uploads to the
+# S3 stack's bucket, and builds/pushes to ECR entirely in the cloud.
+SIDECAR_BUILD="${SIDECAR_BUILD:-codebuild}"
+SIDECAR_CODEBUILD_PROJECT="${SIDECAR_CODEBUILD_PROJECT:-${ENVIRONMENT_NAME}-sse-heartbeat-build}"
+SIDECAR_CODEBUILD_ROLE="${SIDECAR_CODEBUILD_ROLE:-${ENVIRONMENT_NAME}-sse-heartbeat-codebuild-role}"
+
 # Bedrock Configuration
 BEDROCK_STACK_NAME="${BEDROCK_STACK_NAME:-litellm-bedrock}"
 
@@ -266,18 +283,22 @@ deploy_bedrock() {
 upload_mantle_key() {
     log_info "Uploading Bedrock Mantle API Key to Secrets Manager..."
 
+    # Optional: the Mantle key is only needed for the gpt-5.x models. Deploying
+    # the service has nothing to do with which AI client (Codex/Claude/Kiro/none)
+    # is installed locally, so a missing key must NOT abort the deploy — it just
+    # leaves the gpt models unusable (Claude/Bedrock models are unaffected).
+    # Source order: env var first (CI/anyone can pass it), then ~/.codex/.env as
+    # a convenience fallback, otherwise warn and skip.
+    local api_key="${BEDROCK_MANTLE_API_KEY:-}"
     local env_file="${HOME}/.codex/.env"
-    if [[ ! -f "${env_file}" ]]; then
-        log_error "File not found: ${env_file}"
-        exit 1
+    if [[ -z "${api_key}" && -f "${env_file}" ]]; then
+        api_key=$(grep '^AWS_BEARER_TOKEN_BEDROCK=' "${env_file}" | cut -d'=' -f2-)
     fi
 
-    local api_key
-    api_key=$(grep '^AWS_BEARER_TOKEN_BEDROCK=' "${env_file}" | cut -d'=' -f2-)
-
     if [[ -z "${api_key}" ]]; then
-        log_error "AWS_BEARER_TOKEN_BEDROCK not found in ${env_file}"
-        exit 1
+        log_warn "No Bedrock Mantle API key found (set BEDROCK_MANTLE_API_KEY or put AWS_BEARER_TOKEN_BEDROCK in ${env_file})."
+        log_warn "Skipping — gpt-5.x models will be unavailable; Claude/Bedrock models work normally."
+        return 0
     fi
 
     local secret_id="${ENVIRONMENT_NAME}/litellm/bedrock-mantle-api-key"
@@ -342,21 +363,188 @@ upload_config() {
 }
 
 #============================================================
+# SSE Heartbeat Sidecar - build & push to ECR
+#============================================================
+
+# Ensure the ECR repo for the sidecar exists (idempotent). Sets SIDECAR_IMAGE.
+ensure_sidecar_ecr() {
+    local account_id
+    account_id=$(aws sts get-caller-identity --query Account --output text)
+    local registry="${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    SIDECAR_IMAGE="${registry}/${SIDECAR_ECR_REPO}:${SIDECAR_IMAGE_TAG}"
+
+    aws ecr describe-repositories --repository-names "${SIDECAR_ECR_REPO}" --region "${AWS_REGION}" &> /dev/null || {
+        log_info "Creating ECR repository: ${SIDECAR_ECR_REPO}"
+        aws ecr create-repository --repository-name "${SIDECAR_ECR_REPO}" \
+            --image-scanning-configuration scanOnPush=true \
+            --region "${AWS_REGION}" > /dev/null
+    }
+}
+
+# Dispatch to the chosen build backend.
+build_sidecar() {
+    ensure_sidecar_ecr
+    log_info "Building SSE heartbeat sidecar image: ${SIDECAR_IMAGE} (backend: ${SIDECAR_BUILD})"
+    case "${SIDECAR_BUILD}" in
+        codebuild) build_sidecar_codebuild ;;
+        docker)    build_sidecar_docker ;;
+        *) log_error "Unknown SIDECAR_BUILD='${SIDECAR_BUILD}' (use 'codebuild' or 'docker')."; exit 1 ;;
+    esac
+    log_info "Sidecar image ready: ${SIDECAR_IMAGE}"
+}
+
+# Legacy local build — requires a working Docker daemon.
+build_sidecar_docker() {
+    local registry="${SIDECAR_IMAGE%/*}"
+    if ! command -v docker &> /dev/null; then
+        log_error "docker is required for SIDECAR_BUILD=docker. Use SIDECAR_BUILD=codebuild for a cloud build."
+        exit 1
+    fi
+    log_info "Logging in to ECR registry ${registry}"
+    aws ecr get-login-password --region "${AWS_REGION}" \
+        | docker login --username AWS --password-stdin "${registry}" > /dev/null
+    # linux/amd64 to match Fargate (build host may be arm64, e.g. Apple Silicon).
+    docker build --platform linux/amd64 -t "${SIDECAR_IMAGE}" ./sse-heartbeat-proxy
+    docker push "${SIDECAR_IMAGE}"
+}
+
+# Cloud build via CodeBuild — NO local container runtime needed. Zips the
+# sidecar source, uploads to the S3 stack's bucket, builds linux/amd64 in
+# CodeBuild (privileged), pushes to ECR. Lets teammates without Docker deploy.
+build_sidecar_codebuild() {
+    local account_id region bucket role_arn build_id status
+    account_id=$(aws sts get-caller-identity --query Account --output text)
+    region="${AWS_REGION}"
+
+    # Reuse the S3 stack's bucket as the CodeBuild source location.
+    bucket=$(aws cloudformation describe-stacks --stack-name "${S3_STACK_NAME}" --region "${region}" \
+        --query 'Stacks[0].Outputs[?OutputKey==`BucketName`].OutputValue' --output text 2>/dev/null || true)
+    if [[ -z "${bucket}" || "${bucket}" == "None" ]]; then
+        log_error "Cannot find S3 bucket (stack ${S3_STACK_NAME}). Deploy S3 stack before the sidecar build."
+        exit 1
+    fi
+    local s3_key="codebuild/${SIDECAR_ECR_REPO}.zip"
+
+    # --- IAM service role for CodeBuild (idempotent) ---
+    role_arn="arn:aws:iam::${account_id}:role/${SIDECAR_CODEBUILD_ROLE}"
+    if ! aws iam get-role --role-name "${SIDECAR_CODEBUILD_ROLE}" &> /dev/null; then
+        log_info "Creating CodeBuild service role: ${SIDECAR_CODEBUILD_ROLE}"
+        aws iam create-role --role-name "${SIDECAR_CODEBUILD_ROLE}" \
+            --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"codebuild.amazonaws.com"},"Action":"sts:AssumeRole"}]}' > /dev/null
+        aws iam put-role-policy --role-name "${SIDECAR_CODEBUILD_ROLE}" \
+            --policy-name "${SIDECAR_CODEBUILD_ROLE}-policy" \
+            --policy-document "$(cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Sid":"CWLogs","Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"arn:aws:logs:${region}:${account_id}:log-group:/aws/codebuild/*"},
+    {"Sid":"S3Source","Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion","s3:GetBucketAcl","s3:GetBucketLocation","s3:ListBucket","s3:ListBucketVersions"],"Resource":["arn:aws:s3:::${bucket}","arn:aws:s3:::${bucket}/*"]},
+    {"Sid":"ECRAuth","Effect":"Allow","Action":"ecr:GetAuthorizationToken","Resource":"*"},
+    {"Sid":"ECRPush","Effect":"Allow","Action":["ecr:BatchCheckLayerAvailability","ecr:CompleteLayerUpload","ecr:InitiateLayerUpload","ecr:PutImage","ecr:UploadLayerPart"],"Resource":"arn:aws:ecr:${region}:${account_id}:repository/${SIDECAR_ECR_REPO}"}
+  ]
+}
+JSON
+)" > /dev/null
+        log_info "Waiting 10s for IAM role to propagate..."
+        sleep 10
+    fi
+
+    # --- Zip & upload source (files flat at zip root) ---
+    local zipfile
+    zipfile="$(mktemp -t sidecar-XXXX).zip"
+    ( cd ./sse-heartbeat-proxy && zip -qr "${zipfile}" . )
+    log_info "Uploading sidecar source to s3://${bucket}/${s3_key}"
+    aws s3 cp "${zipfile}" "s3://${bucket}/${s3_key}" --region "${region}" > /dev/null
+    rm -f "${zipfile}"
+
+    # --- Create/update CodeBuild project ---
+    # Inline buildspec: ECR login, build linux/amd64, push.
+    local buildspec='version: 0.2\nphases:\n  pre_build:\n    commands:\n      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com\n      - REPO_URI=$ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$REPO_NAME\n  build:\n    commands:\n      - docker build --platform linux/amd64 -t $REPO_URI:$IMAGE_TAG .\n  post_build:\n    commands:\n      - docker push $REPO_URI:$IMAGE_TAG\n'
+    local projectjson
+    projectjson="$(mktemp)"
+    cat > "${projectjson}" <<JSON
+{
+  "name": "${SIDECAR_CODEBUILD_PROJECT}",
+  "source": { "type": "S3", "location": "${bucket}/${s3_key}", "buildspec": "${buildspec}" },
+  "artifacts": { "type": "NO_ARTIFACTS" },
+  "environment": {
+    "type": "LINUX_CONTAINER",
+    "image": "aws/codebuild/amazonlinux2-x86_64-standard:5.0",
+    "computeType": "BUILD_GENERAL1_SMALL",
+    "privilegedMode": true,
+    "environmentVariables": [
+      { "name": "ACCOUNT_ID", "value": "${account_id}" },
+      { "name": "AWS_DEFAULT_REGION", "value": "${region}" },
+      { "name": "REPO_NAME", "value": "${SIDECAR_ECR_REPO}" },
+      { "name": "IMAGE_TAG", "value": "${SIDECAR_IMAGE_TAG}" }
+    ]
+  },
+  "serviceRole": "${role_arn}",
+  "logsConfig": { "cloudWatchLogs": { "status": "ENABLED" } }
+}
+JSON
+    if aws codebuild batch-get-projects --names "${SIDECAR_CODEBUILD_PROJECT}" --region "${region}" \
+         --query 'projects[0].name' --output text 2>/dev/null | grep -q "${SIDECAR_CODEBUILD_PROJECT}"; then
+        log_info "Updating CodeBuild project: ${SIDECAR_CODEBUILD_PROJECT}"
+        aws codebuild update-project --cli-input-json "file://${projectjson}" --region "${region}" > /dev/null
+    else
+        log_info "Creating CodeBuild project: ${SIDECAR_CODEBUILD_PROJECT}"
+        aws codebuild create-project --cli-input-json "file://${projectjson}" --region "${region}" > /dev/null
+    fi
+    rm -f "${projectjson}"
+
+    # --- Start build & poll ---
+    # No --source-version: the project's source.location already points at the
+    # zip key. On a versioning-enabled bucket --source-version expects an S3
+    # version ID (not the key), so passing the key fails with InvalidArgument.
+    build_id=$(aws codebuild start-build --project-name "${SIDECAR_CODEBUILD_PROJECT}" \
+        --region "${region}" --query 'build.id' --output text)
+    log_info "CodeBuild started: ${build_id} (polling...)"
+    while true; do
+        status=$(aws codebuild batch-get-builds --ids "${build_id}" --region "${region}" \
+            --query 'builds[0].buildStatus' --output text)
+        case "${status}" in
+            SUCCEEDED) log_info "CodeBuild SUCCEEDED"; break ;;
+            FAILED|FAULT|STOPPED|TIMED_OUT)
+                log_error "CodeBuild ${status}. Logs: https://${region}.console.aws.amazon.com/codesuite/codebuild/${account_id}/projects/${SIDECAR_CODEBUILD_PROJECT}/build/${build_id}/log"
+                exit 1 ;;
+            *) sleep 15 ;;
+        esac
+    done
+}
+
+#============================================================
 # ECS Deployment
 #============================================================
 deploy_ecs() {
-    # 交互式提示输入镜像版本
+    # 交互式提示输入镜像版本（非交互运行——管道/CI——时读到 EOF 直接用默认值，
+    # 不让 `set -e` 因 read 返回非零而中止）
     echo ""
     log_info "当前默认镜像: ${LITELLM_IMAGE}"
-    read -p "请输入 LiteLLM 镜像地址 (直接回车使用默认值): " input_image
+    local input_image=""
+    if [[ -t 0 ]]; then
+        read -p "请输入 LiteLLM 镜像地址 (直接回车使用默认值): " input_image || true
+    else
+        log_info "非交互模式，使用默认镜像。"
+    fi
     if [[ -n "${input_image}" ]]; then
         LITELLM_IMAGE="${input_image}"
+    fi
+
+    # Build & push the heartbeat sidecar first if enabled (sets SIDECAR_IMAGE).
+    if [[ "${ENABLE_SIDECAR}" == "true" ]]; then
+        build_sidecar
     fi
 
     log_info "Deploying ECS stack: ${ECS_STACK_NAME} in region: ${AWS_REGION}"
     log_info "Image: ${LITELLM_IMAGE}"
     log_info "CPU: ${TASK_CPU} units, Memory: ${TASK_MEMORY} MB"
     log_info "Desired count: ${DESIRED_COUNT}"
+    if [[ -n "${SIDECAR_IMAGE}" ]]; then
+        log_info "SSE heartbeat sidecar: ENABLED (${SIDECAR_IMAGE}, interval=${HEARTBEAT_INTERVAL}s)"
+    else
+        log_info "SSE heartbeat sidecar: disabled (ALB targets LiteLLM directly)"
+    fi
 
     validate_template "ecs.yaml"
 
@@ -372,6 +560,8 @@ deploy_ecs() {
             TaskMemory="${TASK_MEMORY}" \
             DesiredCount="${DESIRED_COUNT}" \
             SearxngApiBase="${SEARXNG_API_BASE}" \
+            SidecarImage="${SIDECAR_IMAGE}" \
+            HeartbeatInterval="${HEARTBEAT_INTERVAL}" \
         --tags \
             "Project=litellm" \
             "Environment=${ENVIRONMENT_NAME}" \
