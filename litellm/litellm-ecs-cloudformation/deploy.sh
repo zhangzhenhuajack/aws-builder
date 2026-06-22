@@ -31,11 +31,40 @@ S3_STACK_NAME="${S3_STACK_NAME:-litellm-s3}"
 
 # ECS Configuration
 ECS_STACK_NAME="${ECS_STACK_NAME:-litellm-ecs}"
-LITELLM_IMAGE="${LITELLM_IMAGE:-ghcr.io/berriai/litellm:v1.85.1}"
+LITELLM_IMAGE="${LITELLM_IMAGE:-docker.litellm.ai/berriai/litellm:v1.89.0}"
 TASK_CPU="${TASK_CPU:-2048}"
 TASK_MEMORY="${TASK_MEMORY:-4096}"
 DESIRED_COUNT="${DESIRED_COUNT:-2}"
 SEARXNG_API_BASE="${SEARXNG_API_BASE:-}"
+
+# CPU architecture for the Fargate task (default arm64 = Graviton, ~20% cheaper).
+# Override with `ARCH=amd64 ./deploy.sh ...` if you need x86_64 (e.g. when a
+# pinned LiteLLM tag does not publish an arm64 manifest, or a custom container
+# pulls in an x86-only binary). Driven values:
+#   * DOCKER_PLATFORM  -> docker build --platform target (sidecar image)
+#   * CFN_CPU_ARCH     -> CpuArchitecture parameter passed to ecs.yaml
+#   * CB_ENV_TYPE/CB_IMAGE -> CodeBuild env type + curated image for sidecar build
+ARCH="${ARCH:-arm64}"
+case "${ARCH}" in
+    arm64|ARM64|aarch64)
+        ARCH="arm64"
+        DOCKER_PLATFORM="linux/arm64"
+        CFN_CPU_ARCH="ARM64"
+        CB_ENV_TYPE="ARM_CONTAINER"
+        CB_IMAGE="aws/codebuild/amazonlinux2-aarch64-standard:3.0"
+        ;;
+    amd64|AMD64|x86_64|x86-64)
+        ARCH="amd64"
+        DOCKER_PLATFORM="linux/amd64"
+        CFN_CPU_ARCH="X86_64"
+        CB_ENV_TYPE="LINUX_CONTAINER"
+        CB_IMAGE="aws/codebuild/amazonlinux2-x86_64-standard:5.0"
+        ;;
+    *)
+        echo "ERROR: Unsupported ARCH='${ARCH}'. Use arm64 or amd64." >&2
+        exit 1
+        ;;
+esac
 
 # SSE heartbeat sidecar (optional). When ENABLE_SIDECAR=true, deploy-ecs first
 # builds & pushes the sidecar image to ECR, then passes its URI to the stack so
@@ -403,14 +432,15 @@ build_sidecar_docker() {
     log_info "Logging in to ECR registry ${registry}"
     aws ecr get-login-password --region "${AWS_REGION}" \
         | docker login --username AWS --password-stdin "${registry}" > /dev/null
-    # linux/amd64 to match Fargate (build host may be arm64, e.g. Apple Silicon).
-    docker build --platform linux/amd64 -t "${SIDECAR_IMAGE}" ./sse-heartbeat-proxy
+    # Build platform must match Fargate task RuntimePlatform (driven by ARCH).
+    docker build --platform "${DOCKER_PLATFORM}" -t "${SIDECAR_IMAGE}" ./sse-heartbeat-proxy
     docker push "${SIDECAR_IMAGE}"
 }
 
 # Cloud build via CodeBuild — NO local container runtime needed. Zips the
-# sidecar source, uploads to the S3 stack's bucket, builds linux/amd64 in
-# CodeBuild (privileged), pushes to ECR. Lets teammates without Docker deploy.
+# sidecar source, uploads to the S3 stack's bucket, builds for the selected
+# ARCH (linux/amd64 or linux/arm64) in CodeBuild (privileged), pushes to ECR.
+# Lets teammates without Docker deploy.
 build_sidecar_codebuild() {
     local account_id region bucket role_arn build_id status
     account_id=$(aws sts get-caller-identity --query Account --output text)
@@ -458,8 +488,8 @@ JSON
     rm -f "${zipfile}"
 
     # --- Create/update CodeBuild project ---
-    # Inline buildspec: ECR login, build linux/amd64, push.
-    local buildspec='version: 0.2\nphases:\n  pre_build:\n    commands:\n      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com\n      - REPO_URI=$ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$REPO_NAME\n  build:\n    commands:\n      - docker build --platform linux/amd64 -t $REPO_URI:$IMAGE_TAG .\n  post_build:\n    commands:\n      - docker push $REPO_URI:$IMAGE_TAG\n'
+    # Inline buildspec: ECR login, build for selected ARCH, push.
+    local buildspec='version: 0.2\nphases:\n  pre_build:\n    commands:\n      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com\n      - REPO_URI=$ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$REPO_NAME\n  build:\n    commands:\n      - docker build --platform '"${DOCKER_PLATFORM}"' -t $REPO_URI:$IMAGE_TAG .\n  post_build:\n    commands:\n      - docker push $REPO_URI:$IMAGE_TAG\n'
     local projectjson
     projectjson="$(mktemp)"
     cat > "${projectjson}" <<JSON
@@ -468,8 +498,8 @@ JSON
   "source": { "type": "S3", "location": "${bucket}/${s3_key}", "buildspec": "${buildspec}" },
   "artifacts": { "type": "NO_ARTIFACTS" },
   "environment": {
-    "type": "LINUX_CONTAINER",
-    "image": "aws/codebuild/amazonlinux2-x86_64-standard:5.0",
+    "type": "${CB_ENV_TYPE}",
+    "image": "${CB_IMAGE}",
     "computeType": "BUILD_GENERAL1_SMALL",
     "privilegedMode": true,
     "environmentVariables": [
@@ -538,6 +568,7 @@ deploy_ecs() {
 
     log_info "Deploying ECS stack: ${ECS_STACK_NAME} in region: ${AWS_REGION}"
     log_info "Image: ${LITELLM_IMAGE}"
+    log_info "CPU architecture: ${CFN_CPU_ARCH} (ARCH=${ARCH})"
     log_info "CPU: ${TASK_CPU} units, Memory: ${TASK_MEMORY} MB"
     log_info "Desired count: ${DESIRED_COUNT}"
     if [[ -n "${SIDECAR_IMAGE}" ]]; then
@@ -562,6 +593,7 @@ deploy_ecs() {
             SearxngApiBase="${SEARXNG_API_BASE}" \
             SidecarImage="${SIDECAR_IMAGE}" \
             HeartbeatInterval="${HEARTBEAT_INTERVAL}" \
+            CpuArchitecture="${CFN_CPU_ARCH}" \
         --tags \
             "Project=litellm" \
             "Environment=${ENVIRONMENT_NAME}" \
