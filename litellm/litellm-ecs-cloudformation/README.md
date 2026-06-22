@@ -99,7 +99,7 @@
 | 资源 | 说明 |
 |------|------|
 | ECS Cluster | Container Insights 监控 |
-| Task Definition | Fargate, 2 vCPU / 4 GB，Init 容器下载 S3 配置 |
+| Task Definition | Fargate, 2 vCPU / 4 GB，**ARM64 (Graviton) 默认**，Init 容器下载 S3 配置 |
 | ECS Service | 私有子网，部署断路器 + 自动回滚 |
 | Internal ALB | 内网负载均衡，仅 VPC 内可访问 |
 | Auto Scaling | CPU 70% / Memory 80% 触发，最大 10 副本 |
@@ -138,6 +138,8 @@ chmod +x deploy.sh
 ./deploy.sh deploy-ecs
 ./deploy.sh deploy-cloudfront   # 可选
 ```
+
+> 💡 **CPU 架构**:任务默认运行在 **ARM64 (Graviton)** 上,获得更好的性价比。若需要切换到 X86_64,在所有 `deploy*` 命令前加 `ARCH=amd64` 环境变量(例如 `ARCH=amd64 ./deploy.sh deploy-all`)。该变量会同时影响:Fargate 任务 `RuntimePlatform`、SSE sidecar 镜像构建平台、以及 CodeBuild 项目类型。
 
 ## 部署后操作
 
@@ -298,7 +300,8 @@ chmod +x manage-waf-ip-whitelist.sh
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `ECS_STACK_NAME` | litellm-ecs | 栈名称 |
-| `LITELLM_IMAGE` | ghcr.io/berriai/litellm:v1.85.1 | Docker 镜像 |
+| `LITELLM_IMAGE` | docker.litellm.ai/berriai/litellm:v1.89.0 | Docker 镜像（默认 tag 同时发布 amd64 / arm64 manifest） |
+| `ARCH` | arm64 | Fargate 任务 CPU 架构。`arm64` 跑在 Graviton 上,价格/性能更优;若要切回 x86 设 `ARCH=amd64`(同时影响 sidecar 镜像构建平台和 CodeBuild 容器类型)。 |
 | `TASK_CPU` | 2048 | CPU 单位 (2 vCPU) |
 | `TASK_MEMORY` | 4096 | 内存 (4 GB) |
 | `DESIRED_COUNT` | 2 | 期望副本数 |
@@ -650,9 +653,14 @@ aws ecs describe-task-definition \
 # 稳定版格式: v1.85.0, v1.85.1, ...
 # 开发版格式: 1.84.0-dev.2, ...
 # 浏览所有版本: https://github.com/BerriAI/litellm/pkgs/container/litellm
+# 注: docker.litellm.ai 是 ghcr.io/berriai/litellm 的镜像别名,
+# 同一 tag 通常同时发布 linux/amd64 与 linux/arm64 manifest。
 
 # 3. 升级到指定版本
-LITELLM_IMAGE=ghcr.io/berriai/litellm:v1.85.1 ./deploy.sh deploy-ecs
+LITELLM_IMAGE=docker.litellm.ai/berriai/litellm:v1.89.0 ./deploy.sh deploy-ecs
+
+# 3a. 切换到 X86_64 (Graviton 不可用或需要 x86-only 镜像时)
+ARCH=amd64 ./deploy.sh deploy-ecs
 
 # 4. 验证部署状态
 aws ecs describe-services --cluster litellm-ecs-cluster \

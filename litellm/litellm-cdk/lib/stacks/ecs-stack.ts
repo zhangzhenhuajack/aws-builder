@@ -131,6 +131,12 @@ export class EcsStack extends cdk.Stack {
       memoryLimitMiB: config.taskMemory,
       executionRole: taskExecutionRole,
       taskRole: taskRole,
+      runtimePlatform: {
+        cpuArchitecture: config.cpuArchitecture === 'ARM64'
+          ? ecs.CpuArchitecture.ARM64
+          : ecs.CpuArchitecture.X86_64,
+        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+      },
     });
 
     // Shared volume

@@ -11,8 +11,12 @@ Parameters:
 
   LiteLLMImage:
     Type: String
-    Default: ghcr.io/berriai/litellm:1.84.0-dev.2
-    Description: LiteLLM Docker image
+    Default: docker.litellm.ai/berriai/litellm:v1.89.0
+    Description: >
+      LiteLLM Docker image. Default tag publishes both linux/amd64 and
+      linux/arm64 manifests, so it works with the CpuArchitecture parameter
+      below. If you switch to a custom image, make sure it provides the
+      architecture you select.
 
   TaskCpu:
     Type: Number
@@ -38,6 +42,18 @@ Parameters:
     Type: Number
     Default: 4000
     Description: Container port for LiteLLM
+
+  CpuArchitecture:
+    Type: String
+    Default: ARM64
+    AllowedValues:
+      - ARM64
+      - X86_64
+    Description: >
+      Fargate task CPU architecture. Default ARM64 runs on AWS Graviton for
+      better price/performance. Switch to X86_64 if you must use an image
+      that does not publish an arm64 manifest, or if a third-party
+      dependency in the task is x86-only.
 
   SidecarImage:
     Type: String
@@ -344,6 +360,9 @@ Resources:
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: !Ref CpuArchitecture
+        OperatingSystemFamily: LINUX
       Cpu: !Ref TaskCpu
       Memory: !Ref TaskMemory
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn

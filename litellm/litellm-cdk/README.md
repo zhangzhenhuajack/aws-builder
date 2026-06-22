@@ -86,7 +86,8 @@ CDK 会自动按依赖顺序部署：VpcStack → S3Stack → DatabaseStack → 
 | `auroraMaxAcu` | `8` | Aurora 最大容量 (ACU) |
 | `redisMaxMemory` | `5` | Redis 最大存储 (GB) |
 | `redisMaxEcpu` | `15000` | Redis 最大 ECPU |
-| `litellmImage` | `ghcr.io/berriai/litellm:1.84.0-dev.2` | LiteLLM Docker 镜像 |
+| `litellmImage` | `docker.litellm.ai/berriai/litellm:v1.89.0` | LiteLLM Docker 镜像（默认 tag 同时发布 amd64 / arm64 manifest） |
+| `cpuArchitecture` | `ARM64` | Fargate 任务 CPU 架构。`ARM64` 跑在 Graviton 上,价格/性能更优;若需切回 x86 设 `X86_64`(只对 ECS 任务生效,不影响 ALB/CloudFront/Aurora) |
 | `taskCpu` | `2048` | ECS 任务 CPU 单位 (2 vCPU) |
 | `taskMemory` | `4096` | ECS 任务内存 (4 GB) |
 | `desiredCount` | `2` | ECS 期望副本数 |
@@ -113,6 +114,8 @@ npx cdk deploy --all \
   -c auroraMaxAcu=16 \
   -c rateLimitPerIp=5000
 ```
+
+> 💡 **CPU 架构**:任务默认运行在 **ARM64 (Graviton)** 上,获得更好的性价比。如需切换到 X86_64,加上 `-c cpuArchitecture=X86_64`(例如 `npx cdk deploy --all -c cpuArchitecture=X86_64`)。注意切换后必须确保 `litellmImage` 的镜像 tag 也发布了对应架构的 manifest。
 
 ## 部署后操作
 
