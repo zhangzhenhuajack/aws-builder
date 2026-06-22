@@ -13,6 +13,7 @@ describe('BedrockStack', () => {
     redisMaxMemory: 5,
     redisMaxEcpu: 15000,
     litellmImage: 'ghcr.io/berriai/litellm:latest',
+    cpuArchitecture: 'ARM64',
     taskCpu: 2048,
     taskMemory: 4096,
     desiredCount: 2,

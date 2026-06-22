@@ -12,6 +12,11 @@ import { CloudFrontStack } from '../lib/stacks/cloudfront-stack';
  * Load configuration from CDK Context with defaults matching cdk.json context values.
  */
 function loadConfig(app: cdk.App): AppConfig {
+  const cpuArch = (app.node.tryGetContext('cpuArchitecture') as string | undefined) ?? 'ARM64';
+  if (cpuArch !== 'ARM64' && cpuArch !== 'X86_64') {
+    throw new Error(`Invalid cpuArchitecture context value: ${cpuArch}. Must be 'ARM64' or 'X86_64'.`);
+  }
+
   return {
     environmentName: app.node.tryGetContext('environmentName') || 'litellm',
     vpcCidr: app.node.tryGetContext('vpcCidr') || '10.0.0.0/16',
@@ -19,7 +24,8 @@ function loadConfig(app: cdk.App): AppConfig {
     auroraMaxAcu: app.node.tryGetContext('auroraMaxAcu') ?? 8,
     redisMaxMemory: app.node.tryGetContext('redisMaxMemory') ?? 5,
     redisMaxEcpu: app.node.tryGetContext('redisMaxEcpu') ?? 15000,
-    litellmImage: app.node.tryGetContext('litellmImage') || 'ghcr.io/berriai/litellm:1.84.0-dev.2',
+    litellmImage: app.node.tryGetContext('litellmImage') || 'docker.litellm.ai/berriai/litellm:v1.89.0',
+    cpuArchitecture: cpuArch,
     taskCpu: app.node.tryGetContext('taskCpu') ?? 2048,
     taskMemory: app.node.tryGetContext('taskMemory') ?? 4096,
     desiredCount: app.node.tryGetContext('desiredCount') ?? 2,

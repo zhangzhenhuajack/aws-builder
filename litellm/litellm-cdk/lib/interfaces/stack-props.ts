@@ -16,6 +16,12 @@ export interface AppConfig {
   redisMaxMemory: number;
   redisMaxEcpu: number;
   litellmImage: string;
+  /**
+   * Fargate 任务 CPU 架构。
+   * - 'ARM64': Graviton,价格/性能更优 (默认)
+   * - 'X86_64': Intel/AMD,兼容仅发布 amd64 manifest 的镜像
+   */
+  cpuArchitecture: 'ARM64' | 'X86_64';
   taskCpu: number;
   taskMemory: number;
   desiredCount: number;
