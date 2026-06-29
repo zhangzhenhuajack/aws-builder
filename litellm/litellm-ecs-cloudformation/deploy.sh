@@ -86,6 +86,22 @@ SIDECAR_CODEBUILD_ROLE="${SIDECAR_CODEBUILD_ROLE:-${ENVIRONMENT_NAME}-sse-heartb
 # Bedrock Configuration
 BEDROCK_STACK_NAME="${BEDROCK_STACK_NAME:-litellm-bedrock}"
 
+# Bedrock Logging & Alert Configuration
+LOGGING_STACK_NAME="${LOGGING_STACK_NAME:-litellm-bedrock-logging}"
+LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-90}"
+ALERT_EMAIL="${ALERT_EMAIL:-}"
+INVOCATION_ALARM_THRESHOLD="${INVOCATION_ALARM_THRESHOLD:-1000}"
+ALARM_PERIOD_SECONDS="${ALARM_PERIOD_SECONDS:-300}"
+ALARM_EVALUATION_PERIODS="${ALARM_EVALUATION_PERIODS:-1}"
+# Native AWS/Bedrock metric alarm thresholds (per period)
+INVOCATIONS_THRESHOLD="${INVOCATIONS_THRESHOLD:-1000}"
+THROTTLE_THRESHOLD="${THROTTLE_THRESHOLD:-10}"
+CLIENT_ERROR_THRESHOLD="${CLIENT_ERROR_THRESHOLD:-50}"
+SERVER_ERROR_THRESHOLD="${SERVER_ERROR_THRESHOLD:-10}"
+LATENCY_THRESHOLD_MS="${LATENCY_THRESHOLD_MS:-15000}"
+INPUT_TOKEN_THRESHOLD="${INPUT_TOKEN_THRESHOLD:-1000000}"
+OUTPUT_TOKEN_THRESHOLD="${OUTPUT_TOKEN_THRESHOLD:-500000}"
+
 # CloudFront + WAF Configuration
 CF_STACK_NAME="${CF_STACK_NAME:-litellm-cloudfront}"
 DOMAIN_NAME="${DOMAIN_NAME:-}"
@@ -304,6 +320,55 @@ deploy_bedrock() {
     echo "    --secret-id ${ENVIRONMENT_NAME}/litellm/bedrock-api-key \\"
     echo "    --region ${AWS_REGION} \\"
     echo "    --query 'SecretString' --output text | jq -r '.AWS_BEARER_TOKEN_BEDROCK'"
+}
+
+#============================================================
+# Bedrock Logging & Alert Deployment
+# (Model Invocation Logging -> CloudWatch Logs + spike alarm)
+#============================================================
+deploy_logging() {
+    log_info "Deploying Bedrock Logging & Alert stack: ${LOGGING_STACK_NAME} in region: ${AWS_REGION}"
+    log_info "Log retention: ${LOG_RETENTION_DAYS} days | Alarm threshold: ${INVOCATION_ALARM_THRESHOLD} invocations / ${ALARM_PERIOD_SECONDS}s"
+    if [[ -n "${ALERT_EMAIL}" ]]; then
+        log_info "Alert email: ${ALERT_EMAIL} (confirm the SNS subscription email after deploy)"
+    else
+        log_warn "No ALERT_EMAIL set — alarm will fire to SNS topic but no email subscription is created."
+    fi
+
+    validate_template "bedrock-logging.yaml"
+
+    aws cloudformation deploy \
+        --template-file bedrock-logging.yaml \
+        --stack-name "${LOGGING_STACK_NAME}" \
+        --region "${AWS_REGION}" \
+        --capabilities CAPABILITY_NAMED_IAM \
+        --parameter-overrides \
+            EnvironmentName="${ENVIRONMENT_NAME}" \
+            LogRetentionDays="${LOG_RETENTION_DAYS}" \
+            AlertEmail="${ALERT_EMAIL}" \
+            InvocationAlarmThreshold="${INVOCATION_ALARM_THRESHOLD}" \
+            AlarmPeriodSeconds="${ALARM_PERIOD_SECONDS}" \
+            AlarmEvaluationPeriods="${ALARM_EVALUATION_PERIODS}" \
+            InvocationsThreshold="${INVOCATIONS_THRESHOLD}" \
+            ThrottleThreshold="${THROTTLE_THRESHOLD}" \
+            ClientErrorThreshold="${CLIENT_ERROR_THRESHOLD}" \
+            ServerErrorThreshold="${SERVER_ERROR_THRESHOLD}" \
+            LatencyThresholdMs="${LATENCY_THRESHOLD_MS}" \
+            InputTokenThreshold="${INPUT_TOKEN_THRESHOLD}" \
+            OutputTokenThreshold="${OUTPUT_TOKEN_THRESHOLD}" \
+        --tags \
+            "Project=litellm" \
+            "Environment=${ENVIRONMENT_NAME}" \
+            "ManagedBy=CloudFormation" \
+        --no-fail-on-empty-changeset
+
+    log_info "Bedrock Logging & Alert stack deployment completed!"
+    show_outputs "${LOGGING_STACK_NAME}"
+
+    echo ""
+    log_info "Bedrock Model Invocation Logging is now ON for region ${AWS_REGION} (account-level setting)."
+    log_info "Tail the invocation logs with:"
+    echo "  aws logs tail /aws/bedrock/${ENVIRONMENT_NAME}/model-invocations --follow --region ${AWS_REGION}"
 }
 
 #============================================================
@@ -667,6 +732,7 @@ deploy_all() {
     deploy_s3
     deploy_database
     deploy_bedrock
+    deploy_logging
     deploy_ecs
     upload_config
     upload_mantle_key
@@ -689,6 +755,10 @@ delete_all() {
         log_info "Deleting ECS stack..."
         aws cloudformation delete-stack --stack-name "${ECS_STACK_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
         aws cloudformation wait stack-delete-complete --stack-name "${ECS_STACK_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
+
+        log_info "Deleting Bedrock Logging & Alert stack..."
+        aws cloudformation delete-stack --stack-name "${LOGGING_STACK_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
+        aws cloudformation wait stack-delete-complete --stack-name "${LOGGING_STACK_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
 
         log_info "Deleting Bedrock stack..."
         aws cloudformation delete-stack --stack-name "${BEDROCK_STACK_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
@@ -721,6 +791,9 @@ usage() {
     echo "  deploy-db     Deploy the Database stack (Aurora + Redis + DynamoDB)"
     echo "  deploy-s3     Deploy the S3 stack"
     echo "  deploy-ecs    Deploy the ECS stack (Fargate + ALB)"
+    echo "  deploy-logging Deploy Bedrock Model Invocation Logging -> CloudWatch + spike alarm"
+    echo "  deploy-guardduty Enable GuardDuty anomalous API detection + findings alert (script)"
+    echo "  deploy-anomaly Add Bedrock anomaly-detection alarms + cost anomaly detection (script)"
     echo "  deploy-all    Deploy all stacks in order (default)"
     echo "  upload-config Upload litellm_config.yaml to S3"
     echo "  validate      Validate all CloudFormation templates"
@@ -752,6 +825,14 @@ usage() {
     echo "  REDIS_MAX_MEMORY       Redis max memory in GB (default: 5)"
     echo "  REDIS_MAX_ECPU         Redis max ECPU/s (default: 15000)"
     echo ""
+    echo "  Bedrock Logging & Alert:"
+    echo "  LOGGING_STACK_NAME          Logging stack name (default: litellm-bedrock-logging)"
+    echo "  LOG_RETENTION_DAYS          CloudWatch Logs retention in days (default: 90)"
+    echo "  ALERT_EMAIL                 Email for invocation-spike alarm (default: none)"
+    echo "  INVOCATION_ALARM_THRESHOLD  Invocations per period before alarm (default: 1000)"
+    echo "  ALARM_PERIOD_SECONDS        Alarm evaluation period in seconds (default: 300)"
+    echo "  ALARM_EVALUATION_PERIODS    Periods that must breach (default: 1)"
+    echo ""
     echo "Note: Database password is auto-generated and stored in AWS Secrets Manager."
 }
 
@@ -780,6 +861,18 @@ main() {
             check_prerequisites
             deploy_bedrock
             ;;
+        deploy-logging)
+            check_prerequisites
+            deploy_logging
+            ;;
+        deploy-guardduty)
+            check_prerequisites
+            AWS_REGION="${AWS_REGION}" ENVIRONMENT_NAME="${ENVIRONMENT_NAME}" ALERT_EMAIL="${ALERT_EMAIL}" ./enable-guardduty.sh
+            ;;
+        deploy-anomaly)
+            check_prerequisites
+            AWS_REGION="${AWS_REGION}" ENVIRONMENT_NAME="${ENVIRONMENT_NAME}" ALERT_EMAIL="${ALERT_EMAIL}" ./bedrock-anomaly-detection.sh
+            ;;
         deploy-cloudfront|deploy-cf)
             check_prerequisites
             deploy_cloudfront
@@ -802,6 +895,7 @@ main() {
             validate_template "database.yaml"
             validate_template "s3.yaml"
             validate_template "bedrock.yaml"
+            validate_template "bedrock-logging.yaml"
             validate_template "ecs.yaml"
             validate_template "cloudfront-waf.yaml"
             ;;
@@ -819,6 +913,9 @@ main() {
             ;;
         outputs-bedrock)
             show_outputs "${BEDROCK_STACK_NAME}"
+            ;;
+        outputs-logging)
+            show_outputs "${LOGGING_STACK_NAME}"
             ;;
         outputs-cloudfront|outputs-cf)
             show_outputs "${CF_STACK_NAME}"
@@ -842,6 +939,10 @@ main() {
         delete-bedrock)
             check_prerequisites
             delete_stack "${BEDROCK_STACK_NAME}"
+            ;;
+        delete-logging)
+            check_prerequisites
+            delete_stack "${LOGGING_STACK_NAME}"
             ;;
         delete-cloudfront|delete-cf)
             check_prerequisites
