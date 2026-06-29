@@ -1,0 +1,419 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock Model Invocation Logging -> CloudWatch Logs, plus a usage alert.
+  Enables account/region-level Bedrock invocation logging (via a custom resource
+  because there is no native CloudFormation resource), creates the destination
+  Log Group + the IAM role Bedrock assumes to write logs, and adds a metric
+  filter + CloudWatch alarm (optional SNS email) to flag abnormal invocation
+  spikes (useful for detecting leaked/abused Bedrock credentials).
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: litellm
+    Description: Environment name prefix
+
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    Description: CloudWatch Logs retention for Bedrock invocation logs (days)
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 3653]
+
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional email to subscribe to the invocation-spike alarm (leave empty to skip SNS subscription)
+
+  InvocationAlarmThreshold:
+    Type: Number
+    Default: 1000
+    Description: Alarm when Bedrock invocations (log events) in one period exceed this number
+
+  AlarmPeriodSeconds:
+    Type: Number
+    Default: 300
+    Description: Evaluation period for the invocation alarm (seconds)
+
+  AlarmEvaluationPeriods:
+    Type: Number
+    Default: 1
+    Description: Number of periods that must breach before the alarm fires
+
+  # --- Native AWS/Bedrock metric alarm thresholds (per AlarmPeriodSeconds) ---
+  InvocationsThreshold:
+    Type: Number
+    Default: 1000
+    Description: Alarm when AWS/Bedrock Invocations (Sum) exceed this per period
+
+  ThrottleThreshold:
+    Type: Number
+    Default: 10
+    Description: Alarm when InvocationThrottles (Sum) exceed this per period
+
+  ClientErrorThreshold:
+    Type: Number
+    Default: 50
+    Description: Alarm when InvocationClientErrors (4xx, Sum) exceed this per period
+
+  ServerErrorThreshold:
+    Type: Number
+    Default: 10
+    Description: Alarm when InvocationServerErrors (5xx, Sum) exceed this per period
+
+  LatencyThresholdMs:
+    Type: Number
+    Default: 15000
+    Description: Alarm when InvocationLatency (Average, ms) exceeds this per period
+
+  InputTokenThreshold:
+    Type: Number
+    Default: 1000000
+    Description: Alarm when InputTokenCount (Sum) exceeds this per period
+
+  OutputTokenThreshold:
+    Type: Number
+    Default: 500000
+    Description: Alarm when OutputTokenCount (Sum) exceeds this per period
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+  #============================================================
+  # CloudWatch Log Group (Bedrock invocation log destination)
+  #============================================================
+  BedrockInvocationLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/bedrock/${EnvironmentName}/model-invocations
+      RetentionInDays: !Ref LogRetentionDays
+
+  #============================================================
+  # IAM Role assumed by Bedrock to write invocation logs.
+  # Confused-deputy protection via aws:SourceAccount / aws:SourceArn.
+  #============================================================
+  BedrockLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-bedrock-logging-role
+      Description: Role Bedrock assumes to deliver model invocation logs to CloudWatch Logs
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:*
+      Policies:
+        - PolicyName: WriteInvocationLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt BedrockInvocationLogGroup.Arn
+                  - !Sub ${BedrockInvocationLogGroup.Arn}:log-stream:*
+
+  #============================================================
+  # Custom resource: turns model invocation logging ON/OFF.
+  # (No native CFN resource exists for this account-level setting.)
+  #============================================================
+  BedrockLoggingCustomResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-bedrock-logging-cr-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ManageBedrockLogging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BedrockLoggingConfig
+                Effect: Allow
+                Action:
+                  - bedrock:PutModelInvocationLoggingConfiguration
+                  - bedrock:GetModelInvocationLoggingConfiguration
+                  - bedrock:DeleteModelInvocationLoggingConfiguration
+                Resource: '*'
+              - Sid: PassLoggingRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt BedrockLoggingRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: bedrock.amazonaws.com
+              - Sid: LambdaOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+
+  BedrockLoggingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-bedrock-enable-logging
+      Description: Enables/disables Bedrock model invocation logging to CloudWatch Logs
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt BedrockLoggingCustomResourceRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          bedrock = boto3.client("bedrock")
+
+          def handler(event, context):
+              rtype = event.get("RequestType")
+              props = event.get("ResourceProperties", {})
+              physical_id = props.get("LogGroupName", "bedrock-model-invocation-logging")
+              try:
+                  if rtype in ("Create", "Update"):
+                      logging_config = {
+                          "cloudWatchConfig": {
+                              "logGroupName": props["LogGroupName"],
+                              "roleArn": props["RoleArn"],
+                          },
+                          "textDataDeliveryEnabled": True,
+                          "imageDataDeliveryEnabled": True,
+                          "embeddingDataDeliveryEnabled": True,
+                      }
+                      bedrock.put_model_invocation_logging_configuration(
+                          loggingConfig=logging_config
+                      )
+                  elif rtype == "Delete":
+                      try:
+                          bedrock.delete_model_invocation_logging_configuration()
+                      except Exception as del_err:  # best-effort cleanup
+                          print("Delete logging config ignored:", del_err)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
+              except Exception as err:
+                  print("ERROR:", err)
+                  cfnresponse.send(
+                      event, context, cfnresponse.FAILED, {"Error": str(err)}, physical_id
+                  )
+
+  EnableBedrockLogging:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - BedrockInvocationLogGroup
+      - BedrockLoggingRole
+    Properties:
+      ServiceToken: !GetAtt BedrockLoggingFunction.Arn
+      LogGroupName: !Ref BedrockInvocationLogGroup
+      RoleArn: !GetAtt BedrockLoggingRole.Arn
+
+  #============================================================
+  # Alerting: count invocations from the log group -> alarm
+  #============================================================
+  BedrockAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${EnvironmentName}-bedrock-alerts
+      DisplayName: !Sub ${EnvironmentName} Bedrock alerts
+
+  BedrockAlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref BedrockAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # Each invocation produces one log event; count them as a metric.
+  BedrockInvocationMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    DependsOn: EnableBedrockLogging
+    Properties:
+      LogGroupName: !Ref BedrockInvocationLogGroup
+      FilterPattern: ''
+      MetricTransformations:
+        - MetricNamespace: !Sub ${EnvironmentName}/Bedrock
+          MetricName: ModelInvocationCount
+          MetricValue: '1'
+          DefaultValue: 0
+
+  BedrockInvocationSpikeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-bedrock-invocation-spike
+      AlarmDescription: >
+        Fires when Bedrock model invocations exceed the configured threshold in a
+        single period. A sustained spike can indicate a leaked/abused credential.
+      Namespace: !Sub ${EnvironmentName}/Bedrock
+      MetricName: ModelInvocationCount
+      Statistic: Sum
+      Period: !Ref AlarmPeriodSeconds
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref InvocationAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BedrockAlertTopic
+      OKActions:
+        - !Ref BedrockAlertTopic
+
+  #============================================================
+  # Native AWS/Bedrock metric alarms (all metric types).
+  # Account-wide (no ModelId dimension) so they catch totals.
+  #============================================================
+  BedrockInvocationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-bedrock-invocations-high
+      AlarmDescription: Bedrock Invocations (Sum) exceeded threshold in a period.
+      Namespace: AWS/Bedrock
+      MetricName: Invocations
+      Statistic: Sum
+      Period: !Ref AlarmPeriodSeconds
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref InvocationsThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref BedrockAlertTopic]
+      OKActions: [!Ref BedrockAlertTopic]
+
+  BedrockThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-bedrock-throttles
+      AlarmDescription: Bedrock InvocationThrottles (Sum) exceeded threshold (capacity/limit pressure).
+      Namespace: AWS/Bedrock
+      MetricName: InvocationThrottles
+      Statistic: Sum
+      Period: !Ref AlarmPeriodSeconds
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref ThrottleThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref BedrockAlertTopic]
+      OKActions: [!Ref BedrockAlertTopic]
+
+  BedrockClientErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-bedrock-client-errors
+      AlarmDescription: Bedrock InvocationClientErrors (4xx, Sum) exceeded threshold.
+      Namespace: AWS/Bedrock
+      MetricName: InvocationClientErrors
+      Statistic: Sum
+      Period: !Ref AlarmPeriodSeconds
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref ClientErrorThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref BedrockAlertTopic]
+      OKActions: [!Ref BedrockAlertTopic]
+
+  BedrockServerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-bedrock-server-errors
+      AlarmDescription: Bedrock InvocationServerErrors (5xx, Sum) exceeded threshold.
+      Namespace: AWS/Bedrock
+      MetricName: InvocationServerErrors
+      Statistic: Sum
+      Period: !Ref AlarmPeriodSeconds
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref ServerErrorThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref BedrockAlertTopic]
+      OKActions: [!Ref BedrockAlertTopic]
+
+  BedrockLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-bedrock-latency-high
+      AlarmDescription: Bedrock InvocationLatency (Average, ms) exceeded threshold.
+      Namespace: AWS/Bedrock
+      MetricName: InvocationLatency
+      Statistic: Average
+      Period: !Ref AlarmPeriodSeconds
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref LatencyThresholdMs
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref BedrockAlertTopic]
+      OKActions: [!Ref BedrockAlertTopic]
+
+  BedrockInputTokenAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-bedrock-input-tokens-high
+      AlarmDescription: Bedrock InputTokenCount (Sum) exceeded threshold (cost/abuse signal).
+      Namespace: AWS/Bedrock
+      MetricName: InputTokenCount
+      Statistic: Sum
+      Period: !Ref AlarmPeriodSeconds
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref InputTokenThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref BedrockAlertTopic]
+      OKActions: [!Ref BedrockAlertTopic]
+
+  BedrockOutputTokenAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-bedrock-output-tokens-high
+      AlarmDescription: Bedrock OutputTokenCount (Sum) exceeded threshold (cost/abuse signal).
+      Namespace: AWS/Bedrock
+      MetricName: OutputTokenCount
+      Statistic: Sum
+      Period: !Ref AlarmPeriodSeconds
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref OutputTokenThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref BedrockAlertTopic]
+      OKActions: [!Ref BedrockAlertTopic]
+
+#============================================================
+# Outputs
+#============================================================
+Outputs:
+  LogGroupName:
+    Description: CloudWatch Log Group receiving Bedrock model invocation logs
+    Value: !Ref BedrockInvocationLogGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-BedrockInvocationLogGroupName
+
+  LogGroupArn:
+    Description: Log Group ARN
+    Value: !GetAtt BedrockInvocationLogGroup.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-BedrockInvocationLogGroupArn
+
+  BedrockLoggingRoleArn:
+    Description: IAM role Bedrock assumes to write invocation logs
+    Value: !GetAtt BedrockLoggingRole.Arn
+
+  AlertTopicArn:
+    Description: SNS topic for Bedrock alerts
+    Value: !Ref BedrockAlertTopic
+    Export:
+      Name: !Sub ${EnvironmentName}-BedrockAlertTopicArn
+
+  InvocationAlarmName:
+    Description: CloudWatch alarm name for invocation spikes
+    Value: !Ref BedrockInvocationSpikeAlarm

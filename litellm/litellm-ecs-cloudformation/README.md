@@ -50,12 +50,15 @@
 | `s3.yaml` | litellm-s3 | S3 存储桶（配置文件 + 日志） |
 | `database.yaml` | litellm-database | Aurora PostgreSQL + Redis + DynamoDB |
 | `bedrock.yaml` | litellm-bedrock | Bedrock IAM 用户 + 凭证 |
+| `bedrock-logging.yaml` | litellm-bedrock-logging | Bedrock 调用日志(→CloudWatch) + 全类型告警 + SNS（安全托底） |
 | `ecs.yaml` | litellm-ecs | ECS Fargate + Internal ALB + Auto Scaling |
 | `cloudfront-waf.yaml` | litellm-cloudfront | CloudFront + WAF（可选） |
 | `litellm_config.yaml` | - | LiteLLM 应用配置（上传到 S3） |
 | `sse-heartbeat-proxy/` | - | SSE 心跳 sidecar（可选，解决长思考流式断连，见故障排查） |
 | `deploy.sh` | - | 一键部署脚本 |
 | `manage-waf-ip-whitelist.sh` | - | WAF IP 白名单管理脚本 |
+| `enable-guardduty.sh` | - | 启用 GuardDuty 异常 API 检测 + findings 告警（脚本，幂等） |
+| `bedrock-anomaly-detection.sh` | - | Bedrock 调用量/Token 异常检测带 + 成本异常告警（脚本，幂等） |
 
 ## 资源清单
 
@@ -134,6 +137,7 @@ chmod +x deploy.sh
 ./deploy.sh deploy-s3
 ./deploy.sh deploy-db
 ./deploy.sh deploy-bedrock
+./deploy.sh deploy-logging      # Bedrock 调用日志 + 全类型告警（安全托底）
 ./deploy.sh upload-config
 ./deploy.sh deploy-ecs
 ./deploy.sh deploy-cloudfront   # 可选
@@ -257,6 +261,9 @@ chmod +x manage-waf-ip-whitelist.sh
 | `./deploy.sh deploy-s3` | 部署 S3 |
 | `./deploy.sh deploy-db` | 部署 Database |
 | `./deploy.sh deploy-bedrock` | 部署 Bedrock |
+| `./deploy.sh deploy-logging` | 部署 Bedrock 调用日志 + 全类型告警（安全托底） |
+| `./deploy.sh deploy-guardduty` | 启用 GuardDuty 异常 API 检测 + findings 告警（调用脚本，幂等） |
+| `./deploy.sh deploy-anomaly` | Bedrock 异常检测带告警 + 成本异常检测（调用脚本，幂等） |
 | `./deploy.sh deploy-ecs` | 部署 ECS |
 | `./deploy.sh deploy-cloudfront` | 部署 CloudFront + WAF |
 | `./deploy.sh upload-config` | 上传配置到 S3 |
@@ -265,6 +272,7 @@ chmod +x manage-waf-ip-whitelist.sh
 | `./deploy.sh outputs-s3` | 查看 S3 输出 |
 | `./deploy.sh outputs-db` | 查看 Database 输出 |
 | `./deploy.sh outputs-bedrock` | 查看 Bedrock 输出 |
+| `./deploy.sh outputs-logging` | 查看 Bedrock 安全托底栈输出（日志组/告警/SNS） |
 | `./deploy.sh outputs-ecs` | 查看 ECS 输出 |
 | `./deploy.sh outputs-cloudfront` | 查看 CloudFront 输出 |
 | `./deploy.sh delete-all` | 删除所有栈（反序） |
@@ -327,6 +335,38 @@ chmod +x manage-waf-ip-whitelist.sh
 | LiteLLM Master Key | Secrets Manager 自动生成 40 位随机密钥 |
 | 数据库密码 | Secrets Manager 自动生成 32 位，URL 编码后注入容器 |
 | API Key 认证 | 用户通过 LiteLLM 生成的 API Key 访问，支持预算/速率限制 |
+
+### Bedrock 安全托底（调用审计与异常告警）
+
+针对 Bedrock 凭证 / API Key 泄露被滥用的场景，提供「调用内容审计 + 多维告警 + 异常检测 + 成本兜底」四层防护。日志与全类型告警已纳入 CloudFormation（随 `deploy-all` 部署）；GuardDuty 与异常检测属账户/区域级一次性设置，用独立幂等脚本开启。
+
+| 能力 | 实现 | 部署方式 |
+|------|------|----------|
+| 调用内容审计（prompt / 响应 / 身份 / token） | Model Invocation Logging → CloudWatch Logs `/aws/bedrock/<env>/model-invocations` | `./deploy.sh deploy-logging` |
+| 全类型调用告警（调用量 / 限流 / 4xx / 5xx / 延迟 / 输入输出 token） | 8 个 CloudWatch 告警 → SNS | `./deploy.sh deploy-logging` |
+| 异常 API 调用检测（陌生 IP / 地理 / impossible travel） | GuardDuty detector + EventBridge → SNS | `./enable-guardduty.sh` |
+| 调用模式突变检测 | CloudWatch Anomaly Detection 带告警（调用量 / Token） | `./bedrock-anomaly-detection.sh` |
+| 成本突增检测 | AWS Cost Anomaly Detection（按服务，覆盖 Bedrock） | `./bedrock-anomaly-detection.sh` |
+
+```bash
+# 1) 调用日志 + 全类型告警（建议带告警邮箱；已含在 deploy-all 中）
+ALERT_EMAIL=you@example.com ./deploy.sh deploy-logging
+
+# 2) GuardDuty 异常 API 检测 + findings 告警（幂等，已启用则只补告警出口）
+ALERT_EMAIL=you@example.com ./enable-guardduty.sh
+#    可选调快发现频率：FINDING_FREQUENCY=FIFTEEN_MINUTES ALERT_EMAIL=... ./enable-guardduty.sh
+
+# 3) 调用量/Token 异常检测带 + 成本异常告警（幂等）
+ALERT_EMAIL=you@example.com ./bedrock-anomaly-detection.sh
+
+# 查看托底栈输出 / 实时看调用日志
+./deploy.sh outputs-logging
+aws logs tail /aws/bedrock/litellm/model-invocations --follow --region us-east-1
+```
+
+> ⚠️ **单例覆盖**：Model Invocation Logging 是账户/区域级单例，开启会覆盖该区域既有配置；`delete-logging` 会关闭该区域的调用日志。
+> ⚠️ **配合 CloudTrail**：本托底覆盖「内容 / 用量 / 行为 / 成本」；定位「谁从哪个 IP 用哪个凭证调用」仍需 CloudTrail（管理事件默认在 90 天 Event History，长期保留需建 Trail）。
+> ⚠️ **邮件确认**：SNS 邮箱订阅与 Cost Anomaly 邮箱订阅创建后需在邮箱点确认才会收到告警。
 
 ### 网络安全
 
