@@ -343,7 +343,7 @@ chmod +x manage-waf-ip-whitelist.sh
 | 能力 | 实现 | 部署方式 |
 |------|------|----------|
 | 调用内容审计（prompt / 响应 / 身份 / token） | Model Invocation Logging → CloudWatch Logs `/aws/bedrock/<env>/model-invocations` | `./deploy.sh deploy-logging` |
-| 全类型调用告警（调用量 / 限流 / 4xx / 5xx / 延迟 / 输入输出 token） | 8 个 CloudWatch 告警 → SNS | `./deploy.sh deploy-logging` |
+| 全类型调用告警（调用量 / 限流 / 4xx / 5xx / 输入输出 token） | 7 个 CloudWatch 告警 → SNS | `./deploy.sh deploy-logging` |
 | 异常 API 调用检测（陌生 IP / 地理 / impossible travel） | GuardDuty detector + EventBridge → SNS | `./enable-guardduty.sh` |
 | 调用模式突变检测 | CloudWatch Anomaly Detection 带告警（调用量 / Token） | `./bedrock-anomaly-detection.sh` |
 | 成本突增检测 | AWS Cost Anomaly Detection（按服务，覆盖 Bedrock） | `./bedrock-anomaly-detection.sh` |

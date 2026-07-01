@@ -60,11 +60,6 @@ Parameters:
     Default: 10
     Description: Alarm when InvocationServerErrors (5xx, Sum) exceed this per period
 
-  LatencyThresholdMs:
-    Type: Number
-    Default: 15000
-    Description: Alarm when InvocationLatency (Average, ms) exceeds this per period
-
   InputTokenThreshold:
     Type: Number
     Default: 1000000
@@ -335,22 +330,6 @@ Resources:
       Period: !Ref AlarmPeriodSeconds
       EvaluationPeriods: !Ref AlarmEvaluationPeriods
       Threshold: !Ref ServerErrorThreshold
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref BedrockAlertTopic]
-      OKActions: [!Ref BedrockAlertTopic]
-
-  BedrockLatencyAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${EnvironmentName}-bedrock-latency-high
-      AlarmDescription: Bedrock InvocationLatency (Average, ms) exceeded threshold.
-      Namespace: AWS/Bedrock
-      MetricName: InvocationLatency
-      Statistic: Average
-      Period: !Ref AlarmPeriodSeconds
-      EvaluationPeriods: !Ref AlarmEvaluationPeriods
-      Threshold: !Ref LatencyThresholdMs
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
       AlarmActions: [!Ref BedrockAlertTopic]
