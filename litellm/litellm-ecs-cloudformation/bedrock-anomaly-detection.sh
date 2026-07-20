@@ -22,7 +22,7 @@ set -uo pipefail
 #   AWS_REGION            default us-east-1
 #   ENVIRONMENT_NAME      default litellm
 #   ALERT_EMAIL           required for subscription/test (warns if empty)
-#   ANOMALY_BAND_STDDEV   default 2   (higher = wider band = fewer alerts)
+#   ANOMALY_BAND_STDDEV   default 4   (higher = wider band = fewer alerts)
 #   ALARM_PERIOD_SECONDS  default 300
 #   COST_THRESHOLD_USD    default 50  (alert when anomaly impact >= this)
 #   SKIP_TEST             default false (set true to skip the test publish)
@@ -31,7 +31,7 @@ set -uo pipefail
 AWS_REGION="${AWS_REGION:-us-east-1}"
 ENVIRONMENT_NAME="${ENVIRONMENT_NAME:-litellm}"
 ALERT_EMAIL="${ALERT_EMAIL:-}"
-ANOMALY_BAND_STDDEV="${ANOMALY_BAND_STDDEV:-2}"
+ANOMALY_BAND_STDDEV="${ANOMALY_BAND_STDDEV:-4}"
 ALARM_PERIOD_SECONDS="${ALARM_PERIOD_SECONDS:-300}"
 COST_THRESHOLD_USD="${COST_THRESHOLD_USD:-50}"
 SKIP_TEST="${SKIP_TEST:-false}"
