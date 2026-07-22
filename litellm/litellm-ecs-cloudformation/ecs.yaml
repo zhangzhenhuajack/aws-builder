@@ -368,7 +368,12 @@ Resources:
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
       TaskRoleArn: !GetAtt TaskRole.Arn
       ContainerDefinitions:
-        # Init container: download config from S3
+        # Init container: download config + custom hooks from S3.
+        # Recursively pulls the whole config/ prefix (litellm_config.yaml plus
+        # any *.py callback hooks, e.g. codex_additional_tools_flatten.py) into
+        # /config. LiteLLM inserts the config file's directory onto sys.path, so
+        # hooks placed here are importable by the bare module name referenced in
+        # litellm_settings.callbacks.
         - Name: config-init
           Image: amazon/aws-cli:latest
           Essential: false
@@ -376,10 +381,11 @@ Resources:
             - "s3"
             - "cp"
             - !Sub
-              - "s3://${BucketName}/config/litellm_config.yaml"
+              - "s3://${BucketName}/config/"
               - BucketName:
                   Fn::ImportValue: !Sub ${EnvironmentName}-S3BucketName
-            - "/config/litellm_config.yaml"
+            - "/config/"
+            - "--recursive"
           MountPoints:
             - SourceVolume: config-volume
               ContainerPath: /config

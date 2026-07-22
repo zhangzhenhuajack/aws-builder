@@ -423,6 +423,18 @@ upload_config() {
     aws s3 cp litellm_config.yaml "s3://${bucket_name}/config/litellm_config.yaml" \
         --region "${AWS_REGION}"
 
+    # Upload custom callback hooks alongside the config. The ECS init container
+    # recursively downloads the whole config/ prefix into /config, and LiteLLM
+    # puts that directory on sys.path so these modules are importable by the
+    # bare name referenced in litellm_settings.callbacks.
+    for hook in codex_additional_tools_flatten.py; do
+        if [[ -f "${hook}" ]]; then
+            log_info "Uploading ${hook} to s3://${bucket_name}/config/${hook}"
+            aws s3 cp "${hook}" "s3://${bucket_name}/config/${hook}" \
+                --region "${AWS_REGION}"
+        fi
+    done
+
     log_info "Config uploaded successfully!"
 
     # Check if ECS service exists before triggering redeployment
