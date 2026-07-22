@@ -38,6 +38,48 @@ model_list:
       drop_params: true
       additional_drop_params: ["client_metadata", "metadata"]
 
+  # ── Codex 内部任务模型别名 ──
+  # Codex（含 guardian_approval 执行前自动审批、自动 review 等）会在后台硬编码
+  # 调用一批 OpenAI 原生 slug（codex-auto-review / gpt-5.4-mini / gpt-5 /
+  # gpt-5-codex）来跑内部任务。网关缺少这些 model_name 会返回 400，进而阻断
+  # Codex 的工具调用链（含 web search）。这里把它们别名映射到真实的 Mantle
+  # 模型上；不关闭 guardian，保留审批能力。
+  - model_name: codex-auto-review
+    litellm_params:
+      model: openai/openai.gpt-5.5
+      api_base: https://bedrock-mantle.us-east-2.api.aws/openai/v1
+      api_key: os.environ/BEDROCK_MANTLE_API_KEY
+      timeout: 900
+      drop_params: true
+      additional_drop_params: ["client_metadata", "metadata"]
+
+  - model_name: gpt-5.4-mini
+    litellm_params:
+      model: openai/openai.gpt-5.4
+      api_base: https://bedrock-mantle.us-east-2.api.aws/openai/v1
+      api_key: os.environ/BEDROCK_MANTLE_API_KEY
+      timeout: 900
+      drop_params: true
+      additional_drop_params: ["client_metadata", "metadata"]
+
+  - model_name: gpt-5
+    litellm_params:
+      model: openai/openai.gpt-5.5
+      api_base: https://bedrock-mantle.us-east-2.api.aws/openai/v1
+      api_key: os.environ/BEDROCK_MANTLE_API_KEY
+      timeout: 900
+      drop_params: true
+      additional_drop_params: ["client_metadata", "metadata"]
+
+  - model_name: gpt-5-codex
+    litellm_params:
+      model: openai/openai.gpt-5.5
+      api_base: https://bedrock-mantle.us-east-2.api.aws/openai/v1
+      api_key: os.environ/BEDROCK_MANTLE_API_KEY
+      timeout: 900
+      drop_params: true
+      additional_drop_params: ["client_metadata", "metadata"]
+
 general_settings:
   database_url: os.environ/DATABASE_URL
   user_api_key_cache_ttl: 300
@@ -52,6 +94,11 @@ litellm_settings:
   enable_redis_auth_cache: true
   store_audit_logs: true
   additional_drop_params: ["client_metadata", "metadata"]
+  # Custom pre-call hook: flattens Codex's non-standard `additional_tools` input
+  # item into the standard top-level `tools` field so Bedrock Mantle's Responses
+  # API accepts the request (see codex_additional_tools_flatten.py). Registered
+  # under `callbacks` (not success_callback) so its async_pre_call_hook fires.
+  callbacks: ["codex_additional_tools_flatten.codex_additional_tools_flatten_instance"]
   cache_params:
     type: redis
     host: os.environ/REDIS_HOST

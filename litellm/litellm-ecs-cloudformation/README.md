@@ -54,6 +54,7 @@
 | `ecs.yaml` | litellm-ecs | ECS Fargate + Internal ALB + Auto Scaling |
 | `cloudfront-waf.yaml` | litellm-cloudfront | CloudFront + WAF（可选） |
 | `litellm_config.yaml` | - | LiteLLM 应用配置（上传到 S3） |
+| `codex_additional_tools_flatten.py` | - | Codex Responses API 适配 hook（随 config 一起上传到 S3，由 ECS init 容器下载） |
 | `sse-heartbeat-proxy/` | - | SSE 心跳 sidecar（可选，解决长思考流式断连，见故障排查） |
 | `deploy.sh` | - | 一键部署脚本 |
 | `manage-waf-ip-whitelist.sh` | - | WAF IP 白名单管理脚本 |
@@ -792,6 +793,77 @@ print(response.choices[0].message.content)
 ```
 
 > 💡 将 `<your-cloudfront-domain>` 替换为你的 CloudFront 域名或自定义域名。
+
+## Codex（Responses API）适配
+
+OpenAI Codex CLI/App 通过本网关调用 Bedrock Mantle 上的 GPT 模型（走 Responses API，`/v1/responses`）时，有两处不兼容需要在网关层抹平。本项目已内置以下适配，随 `upload-config` 一起生效，**无需改动 Codex 客户端**。
+
+### 场景 1：Codex 内部任务模型别名
+
+**现象**：Codex 除了你选的主模型外，还会在后台**硬编码调用**一批 OpenAI 原生 slug 来跑内部任务——例如执行前的自动审批（`guardian_approval`）、自动 code review、web search 的工具调用等。常见 slug：`codex-auto-review`、`gpt-5.4-mini`、`gpt-5`、`gpt-5-codex`。网关若没有这些 `model_name`，会返回 **400**，进而阻断 Codex 的整条工具调用链（含 web search）。
+
+**适配**：在 `litellm_config.yaml` 的 `model_list` 中，把这些 slug **别名映射**到真实存在的 Mantle 模型上（不关闭 guardian，保留审批能力）：
+
+| Codex 内部 slug | 映射到的真实模型 |
+|-----------------|------------------|
+| `codex-auto-review` | `openai.gpt-5.5` |
+| `gpt-5.4-mini` | `openai.gpt-5.4` |
+| `gpt-5` | `openai.gpt-5.5` |
+| `gpt-5-codex` | `openai.gpt-5.5` |
+
+### 场景 2：`additional_tools` 扁平化 Hook
+
+**现象**：较新版本的 Codex（>=26.707，"Responses Lite" 序列化）会把工具列表塞进一个**非标准**的 input item：
+
+```json
+{"type": "additional_tools", "role": "developer", "tools": [ ... ]}
+```
+
+Bedrock Mantle 的 Responses API 只接受**标准 OpenAI Responses schema**（`input` 里只能是 message/reasoning/function_call 等）。`additional_tools` 是 Codex 私有变体，Mantle 会把整个请求拒掉：
+
+```
+400 validation_error: Invalid 'input': value did not match any expected variant
+```
+（对应 Codex GitHub issue #32086）
+
+**适配**：`codex_additional_tools_flatten.py` 是一个 LiteLLM `async_pre_call_hook`，在请求发出前改写 body：
+
+1. 找出所有 `type == "additional_tools"` 的 input item；
+2. 把其中的 `tools` 合并进顶层 `data["tools"]`（Mantle 认顶层 tools）；
+3. 从 `data["input"]` 中删除这些非标 item（**即使 tools 为空也删**——Codex 后续 turn 会重发空 `additional_tools` item，不删同样触发 400）。
+
+Hook 只处理 `aresponses` 且 input 中确实含 `additional_tools` 的请求，其余请求原样透传；改写失败时记日志并透传**原始请求**，绝不因此丢请求。
+
+### ECS 上的加载方式
+
+与 EKS ConfigMap 内联挂载不同，本项目的配置和 hook 都存放在 S3，由 ECS init 容器下载：
+
+- `deploy.sh upload-config` 会把 `litellm_config.yaml` **和** `codex_additional_tools_flatten.py` 一起上传到 S3 的 `config/` 前缀；
+- ECS Task 的 `config-init` init 容器**递归下载**整个 `config/` 前缀到 `/config`；
+- LiteLLM 会把配置文件所在目录（`/config`）加入 `sys.path`，因此 `litellm_settings.callbacks` 里用**裸模块名**引用的 hook 可被正常 import：
+
+```yaml
+litellm_settings:
+  callbacks: ["codex_additional_tools_flatten.codex_additional_tools_flatten_instance"]
+```
+
+> 💡 新增其他 Python callback hook 时，把 `.py` 放到项目根目录、在 `deploy.sh` 的 `upload_config` hook 列表里加上文件名、并在 `callbacks` 里引用即可——init 容器的递归下载会自动带上它。
+
+### 生效方式
+
+```bash
+# 1. 设置 Bedrock Mantle API Key（GPT 模型鉴权）
+aws secretsmanager put-secret-value \
+  --secret-id litellm/litellm/bedrock-mantle-api-key \
+  --secret-string '{"BEDROCK_MANTLE_API_KEY":"<你的-key>"}' --region us-east-1
+
+# 2. 上传 config + hook 到 S3
+./deploy.sh upload-config
+
+# 3. 强制 ECS 重新部署以加载新配置与 hook
+aws ecs update-service --cluster litellm-ecs-cluster \
+  --service litellm-litellm-service --force-new-deployment --region us-east-1
+```
 
 ## 未来日志审计演进思路
 
