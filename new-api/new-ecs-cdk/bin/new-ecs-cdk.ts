@@ -5,6 +5,7 @@ import { AppStack } from '../lib/app-stack';
 import { loadConfig } from '../lib/config';
 import { DataStack } from '../lib/data-stack';
 import { NetworkStack } from '../lib/network-stack';
+import { SecurityStack } from '../lib/security-stack';
 
 const app = new App();
 const cfg = loadConfig(app);
@@ -30,7 +31,7 @@ const data = new DataStack(app, `${cfg.prefix}-data`, {
   description: 'new-api: Aurora PostgreSQL Serverless v2, ElastiCache Serverless Valkey, app secrets',
 });
 
-new AppStack(app, `${cfg.prefix}-app`, {
+const appStack = new AppStack(app, `${cfg.prefix}-app`, {
   env,
   config: cfg,
   vpc: network.vpc,
@@ -47,6 +48,17 @@ new AppStack(app, `${cfg.prefix}-app`, {
   dataKeyArn: data.dataKey.keyArn,
   description: `new-api: ECS Fargate, ALB, WAF${cfg.enableAga ? ', Global Accelerator' : ''}`,
 });
+
+if (cfg.enableSecurityBackstop) {
+  new SecurityStack(app, `${cfg.prefix}-security`, {
+    env,
+    config: cfg,
+    albFullName: appStack.albFullName,
+    webAclName: appStack.webAclName,
+    appLogGroupName: appStack.appLogGroupName,
+    description: 'new-api: security backstop (invocation audit, alarms, anomaly detection, GuardDuty, cost anomaly)',
+  });
+}
 
 Tags.of(app).add('Project', 'new-api');
 Tags.of(app).add('Environment', cfg.prefix);

@@ -60,6 +60,11 @@ const ENTRYPOINT_SCRIPT = [
  * 应用层：ECS Fargate（master + worker）、ALB、WAF、Global Accelerator（可选）、DNS/证书、告警。
  */
 export class AppStack extends Stack {
+  /** 供安全托底栈使用 */
+  public readonly albFullName: string;
+  public readonly webAclName: string;
+  public readonly appLogGroupName: string;
+
   constructor(scope: Construct, id: string, props: AppStackProps) {
     super(scope, id, props);
     const cfg = props.config;
@@ -393,6 +398,9 @@ export class AppStack extends Stack {
       logKey: appKey,
     });
     waf.associate(alb.loadBalancerArn);
+    this.albFullName = alb.loadBalancerFullName;
+    this.webAclName = waf.webAcl.name!;
+    this.appLogGroupName = logGroup.logGroupName;
 
     // ---------------------------------------------------------------
     // Global Accelerator（可选）

@@ -95,8 +95,8 @@ llm = group('Internet · LLM upstreams (OpenAI / Claude / Gemini / Bedrock …)'
 users = resource('Users / API clients\n(allowlisted IPs)', 30, 640, 'users', '#232F3D', 56)
 
 # ---------------------------------------------------------------- groups
-group('AWS Cloud', 120, 120, 1600, 1060, CLOUD)
-group('Region: us-west-2', 270, 160, 1430, 1005, REGION)
+group('AWS Cloud', 120, 120, 1870, 1060, CLOUD)
+group('Region: us-west-2', 270, 160, 1700, 1005, REGION)
 group('VPC 10.20.0.0/16', 430, 210, 990, 940, VPC)
 group('Availability Zone us-west-2b', 455, 255, 940, 380, AZ)
 group('Availability Zone us-west-2c', 455, 740, 940, 390, AZ)
@@ -138,6 +138,17 @@ s3 = service('Amazon S3\nALB access logs', 1520, 830, 's3', STORAGE, 48)
 text('Docker Hub image:\ncalciumion/new-api:v1.0.0-rc.47', 1470, 1020, 220, 40,
      'text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=10;fontColor=#545B64;')
 
+# ---------------------------------------------------------------- security backstop (optional stack)
+group('Security backstop (optional)\nstack: newapi-security', 1712, 210, 240, 880,
+      'rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF5F6;strokeColor=#DD344C;dashed=1;verticalAlign=top;fontStyle=1;fontColor=#DD344C;fontSize=12;')
+bedrock = service('Amazon Bedrock\nmodel invocation logging\n(prompt · response · identity · tokens)', 1808, 290, 'bedrock', '#01A88D', 48)
+gduty = service('Amazon GuardDuty\nanomalous API calls\n(new IP · geo · impossible travel)', 1808, 450, 'guardduty', SEC, 48)
+evb = service('Amazon EventBridge\nfindings ≥ Medium → SNS', 1808, 610, 'eventbridge', INTEG, 48)
+cost = service('Cost Anomaly Detection\nper-service · daily email', 1808, 750, 'cost_explorer', STORAGE, 48)
+fnc = service('AWS Lambda\nsingleton custom resource\n(reuse existing config)', 1808, 900, 'lambda', COMPUTE, 48)
+text('Alarms: Bedrock invocations / throttles / 4xx / 5xx /\ninput & output tokens + anomaly bands;\nnew-api 4xx · WAF blocked · app errors', 1716, 1020, 236, 60,
+     'text;html=1;align=center;verticalAlign=top;whiteSpace=wrap;fontSize=10;fontColor=#545B64;')
+
 # ---------------------------------------------------------------- edges
 BLUE, ORANGE, PURPLE, GREY, RED = '#147EBA', '#ED7100', '#C925D1', '#545B64', '#DD344C'
 edge(users, r53, 'DNS', GREY, dashed=True, exit_=(0.5, 0), entry=(0, 0.5), points=[(58, 368)])
@@ -159,9 +170,13 @@ edge(nat_b, igw, '', ORANGE, dashed=True, exit_=(0.5, 0), entry=(0.5, 1))
 edge(igw, llm, '', ORANGE, dashed=True, exit_=(0.5, 0), entry=(0.2, 1))
 edge(vpce_b, sm, 'PrivateLink', GREY, dashed=True, exit_=(1, 0.5), entry=(0, 0.5), points=[(1110, 500), (1110, 284)])
 
+edge(bedrock, cw, 'invocation logs', '#01A88D', dashed=True, exit_=(0, 0.5), entry=(1, 0.25), points=[(1660, 314), (1660, 552)])
+edge(gduty, evb, '', SEC, dashed=True, exit_=(0.5, 1), entry=(0.5, 0))
+edge(evb, sns, 'security alerts', INTEG, dashed=True, exit_=(0, 0.5), entry=(1, 0.5), points=[(1640, 634), (1640, 724)])
+
 xml = ('<mxfile host="drawio" agent="new-api-cdk" version="26.0.0"><diagram id="newapi-arch" name="new-api architecture">'
        '<mxGraphModel dx="1800" dy="1200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" '
-       'pageScale="1" pageWidth="1760" pageHeight="1220" math="0" shadow="0"><root><mxCell id="0"/><mxCell id="1" parent="0"/>'
+       'pageScale="1" pageWidth="2030" pageHeight="1220" math="0" shadow="0"><root><mxCell id="0"/><mxCell id="1" parent="0"/>'
        + ''.join(cells) + '</root></mxGraphModel></diagram></mxfile>\n')
 # draw.io labels use &#xa; for line breaks inside value attributes
 xml = xml.replace('\n', '&#xa;').rstrip('&#xa;') + '\n'

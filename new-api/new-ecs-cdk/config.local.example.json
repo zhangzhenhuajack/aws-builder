@@ -8,6 +8,5 @@
   "availabilityZones": [
     "us-west-2b",
     "us-west-2c"
-  ],
-  "alarmEmail": "ops@example.com"
+  ]
 }

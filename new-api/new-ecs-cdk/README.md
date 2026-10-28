@@ -32,7 +32,7 @@
    出站：ECS ──NAT──▶ OpenAI / Claude / Gemini / Bedrock 等上游
 ```
 
-全部为托管 / Serverless 组件：Fargate、Aurora Serverless v2、ElastiCache Serverless、ALB、AGA、WAF，无 EC2 需要运维。
+全部为托管 / Serverless 组件：Fargate、Aurora Serverless v2、ElastiCache Serverless、ALB、AGA、WAF，无 EC2 需要运维。可选的安全托底栈提供调用审计、调用告警、异常检测、GuardDuty 与成本突增告警（见[安全托底](#安全托底可选栈-newapi-security)）。
 
 ### 栈划分
 
@@ -41,6 +41,38 @@
 | `newapi-network` | VPC、三层子网、NAT、安全组、VPC Endpoints、Flow Logs | 所有安全组集中在此，避免跨栈循环 |
 | `newapi-data` | Aurora、Valkey、Secrets（DB / Valkey / SESSION_SECRET / CRYPTO_SECRET）、KMS | **终止保护**，DB 删除前自动快照 |
 | `newapi-app` | ECS、ALB、WAF、AGA、ACM、Route 53、告警 | 开关 AGA / 改白名单 / 升级镜像只动这个栈 |
+| `newapi-security`（可选，默认开启） | Bedrock 调用日志、Bedrock / new-api 告警、异常检测带、GuardDuty 告警、成本异常检测 | `enableSecurityBackstop=false` 不部署 |
+
+## 用到的 AWS 服务清单
+
+| 服务 | 在本方案中的作用 | 计费方式（概要） |
+|---|---|---|
+| **Amazon VPC** | 隔离网络：公有 / 应用私有 / 数据隔离三层子网，跨 2 个可用区 | 免费 |
+| **NAT Gateway** | 让私有子网里的 new-api 访问外部 LLM 上游（OpenAI / Claude / Gemini 等）；也是上游加白时的固定出口 IP | 按小时 + 流量 |
+| **VPC Endpoints (PrivateLink)** | 访问 Secrets Manager / KMS / CloudWatch Logs / ECR / S3 不出 VPC、不经 NAT | 接口端点按小时 + 流量；S3 网关端点免费 |
+| **VPC Flow Logs** | 记录 VPC 内所有网络流量，用于审计和排查 | 按日志量 |
+| **AWS Global Accelerator**（可选） | 两个固定 Anycast IP，用户就近接入 AWS 骨干网再到 us-west-2，降低跨境/远距离延迟；保留客户端真实 IP | 固定费 + 按流量 |
+| **Elastic Load Balancing (ALB)** | HTTPS 终止（TLS 1.2/1.3）、HTTP→HTTPS 跳转、健康检查、把请求分发到 new-api 任务 | 按小时 + LCU |
+| **AWS WAF** | Web 防火墙：IP 白名单、IP 信誉库、恶意输入、通用攻击规则、单 IP 限速 | WebACL + 规则 + 请求数 |
+| **AWS Certificate Manager** | 自动签发与续期 HTTPS 证书 | 公有证书免费 |
+| **Amazon Route 53** | 域名解析，把域名指向 AGA / ALB；为证书做 DNS 验证 | 托管区 + 查询 |
+| **Amazon ECS on AWS Fargate** | 无服务器容器运行 new-api（Graviton ARM64）：master ×1 负责迁移/定时任务，worker 自动扩缩 | 按 vCPU / 内存秒 |
+| **Amazon Aurora PostgreSQL Serverless v2** | new-api 主数据库（用户、令牌、渠道、计费、使用日志），一写一读跨 AZ，按负载自动扩缩 ACU | 按 ACU 小时 + 存储 + I/O |
+| **Amazon ElastiCache Serverless (Valkey)** | 缓存、限流计数、会话、多节点同步 | 按存储 GB 小时 + ECPU |
+| **AWS Secrets Manager** | 自动生成并保存数据库 / 缓存密码、SESSION_SECRET、CRYPTO_SECRET，启动时注入容器 | 按密钥数 + API 调用 |
+| **AWS KMS** | 客户管理密钥加密数据库、缓存、密钥、日志、SNS（自动轮换） | 每把密钥按月 + 请求 |
+| **Amazon CloudWatch** | 应用 / 数据库 / WAF 日志，Container Insights 指标，所有告警与异常检测 | 日志量、指标、告警数 |
+| **Amazon SNS** | 把告警和安全事件推送到邮箱 | 基本免费（邮件通知） |
+| **Amazon S3** | ALB 访问日志；Bedrock 超大调用内容（安全栈） | 按存储与请求 |
+| **AWS Identity and Access Management** | 最小权限角色：执行角色只能读 4 个密钥，任务角色无任何 AWS 权限 | 免费 |
+| **AWS CloudFormation / AWS CDK** | 基础设施即代码，部署与变更管理；cdk-nag 合规检查 | 免费 |
+| **Amazon Bedrock**（安全栈） | 开启模型调用日志：记录每次调用的 prompt、响应、调用身份、token 数 | 日志按 CloudWatch 计费 |
+| **Amazon GuardDuty**（安全栈） | 威胁检测：陌生 IP、异常地理位置、impossible travel、凭证泄露滥用等异常 API 调用 | 按分析的事件量 |
+| **Amazon EventBridge**（安全栈） | 把 GuardDuty 中危及以上发现转发到 SNS 邮件 | 基本免费 |
+| **AWS Cost Anomaly Detection**（安全栈） | 按服务检测费用突增，每日邮件通知 | 免费 |
+| **AWS Lambda**（安全栈） | 部署时执行一次的自定义资源：配置 Bedrock 日志 / GuardDuty / 成本监控这类账号级单例 | 几乎为零 |
+
+> 具体费用请用 [AWS Pricing Calculator](https://calculator.aws/) 按客户实际流量估算。
 
 ## 前置条件
 
@@ -50,16 +82,38 @@
 
 ## 快速开始
 
+### 客户部署流程
+
 ```bash
+# 0. 准备：Node.js 20+、AWS CLI v2，并登录目标账号
+aws sts get-caller-identity
+
+# 1. 安装依赖 + 首次初始化 CDK（每个账号/区域只需一次）
 npm ci
 ./deploy.sh bootstrap
 
+# 2. 填写环境参数（域名 / 托管区 / 首次访问的白名单 IP）
+cp config.local.example.json config.local.json
+vi config.local.json
+
+# 3. 部署（network → data → app → security，首次约 30 分钟），告警邮箱作为发布参数传入
+ALARM_EMAIL=ops@example.com ./deploy.sh deploy
+
+# 4. 查看输出（访问地址、白名单状态、安全栈各项状态）
+./deploy.sh outputs
+```
+
+部署完成后检查邮箱，**点击两封 AWS SNS 确认邮件**（`<prefix>-alarms` 运维告警、`<prefix>-security-alerts` 安全告警）以及成本异常检测的通知设置，否则收不到告警。
+
+### 更多示例
+
+```bash
+
 # 生产推荐：自定义域名 + HTTPS + 首次部署先开白名单
-./deploy.sh deploy \
+ALARM_EMAIL=ops@example.com ./deploy.sh deploy \
   -c domainName=api.example.com \
   -c hostedZoneId=Z0123456789ABC -c hostedZoneName=example.com \
-  -c wafAllowedIpv4Cidrs=203.0.113.10/32 \
-  -c alarmEmail=ops@example.com
+  -c wafAllowedIpv4Cidrs=203.0.113.10/32
 
 # 不使用 AGA（ALB 自动变为 internet-facing）
 ./deploy.sh deploy -c enableAga=false -c domainName=api.example.com -c certificateArn=arn:aws:acm:us-west-2:...
@@ -102,7 +156,15 @@ npm ci
 | `valkeyMajorVersion` | `8` | Valkey 主版本 |
 | `valkeyMaxDataStorageGb` / `valkeyMaxEcpuPerSecond` | `5` / `15000` | 缓存用量上限（成本护栏） |
 | `logRetentionDays` | `180` | 所有日志组保留期 |
-| `alarmEmail` | 空 | 告警邮箱（需在邮件中确认订阅） |
+| `alarmEmail` | 空 | 告警邮箱，发布时传入：`ALARM_EMAIL=you@example.com ./deploy.sh deploy` 或 `-c alarmEmail=...`（SNS 会发确认邮件，点确认后才能收到告警） |
+| `enableSecurityBackstop` | `true` | 是否部署安全托底栈 `<prefix>-security` |
+| `bedrockInvocationLogging` | `auto` | `auto`：账号该区域未配置 Bedrock 调用日志时才开启，已有配置保持不动；`force`：用本方案配置覆盖；`off`：不处理 |
+| `guardDuty` | `auto` | `auto`：没有 detector 就创建（15 分钟发布频率），已有则复用，只接入告警；`off`：不处理 |
+| `guardDutyMinSeverity` | `4` | 推送到邮箱的最低严重级别（4 = Medium，7 = High） |
+| `costAnomaly` | `true` | 成本异常检测：复用账号已有的“按服务”监控（每个账号最多一个），没有才创建；新增每日邮件订阅 |
+| `costAnomalyThresholdUsd` | `100` | 单次成本异常影响金额达到多少美元才发邮件 |
+| `bedrockAlarmThresholds` | 见 `cdk.json` | 每 5 分钟、全模型合计的阈值：`invocations` 1000、`throttles` 10、`clientErrors` 50、`serverErrors` 10、`inputTokens` 1,000,000、`outputTokens` 500,000 |
+| `anomalyBandStdDev` | `4` | 异常检测带宽度（标准差倍数），越大越不容易误报 |
 
 ## 部署后
 
@@ -129,6 +191,15 @@ npm ci
 - 修改白名单（约 1~3 分钟）：
 
 ```bash
+# 推荐：追加 IP 并立即生效（写入 config.local.json + 直接更新 WAF IP Set，不走 CloudFormation，约 1 分钟）
+./deploy.sh allow-ip                      # 不带参数 = 本机当前出口 IP
+./deploy.sh allow-ip 203.0.113.10/32 198.51.100.0/24
+```
+
+> ⚠️ `checkip.amazonaws.com` 返回的出口 IP 可能与访问 AGA 时的源 IP 不同（企业网络 / VPN 对 AWS 网段走不同出口）。
+> 如果加了白名单仍是 403，以 WAF 实际看到的 IP 为准：控制台 WAF → Web ACL `<prefix>-waf` → Sampled requests（规则 `IpAllowlist`），或查日志组 `aws-waf-logs-<prefix>`。
+
+```bash
 # 改 cdk.json 的 wafAllowedIpv4Cidrs，或直接传参：
 ./deploy.sh deploy-app -c wafAllowedIpv4Cidrs=203.0.113.10/32,198.51.100.0/24
 # 关闭白名单（全网可访问，只保留托管规则 + 限速）
@@ -137,6 +208,30 @@ npm ci
 
 > 白名单以 CDK 配置为唯一来源。不要在控制台直接改 IP Set，下次 `cdk deploy` 会被覆盖。
 > WAF 日志：CloudWatch Logs `aws-waf-logs-<prefix>`（已脱敏 `Authorization`、`Cookie`）。
+
+## 安全托底（可选栈 `newapi-security`）
+
+| 能力 | 实现 | 去哪里看 |
+|---|---|---|
+| **调用内容审计**（prompt / 响应 / 调用身份 / token） | Bedrock Model Invocation Logging → CloudWatch Logs `/aws/bedrock/<prefix>/model-invocations`（KMS 加密，保留 `logRetentionDays`）；超过 100 KB 的内容写入 S3（KMS） | CloudWatch Logs Insights；`aws logs tail /aws/bedrock/<prefix>/model-invocations --follow` |
+| **全类型调用告警** | Bedrock：调用量 / 限流 / 4xx / 5xx / 输入 token / 输出 token（全模型合计，每 5 分钟）；new-api：ALB 4xx 激增、WAF 拦截激增、应用错误日志 | CloudWatch 告警 `<prefix>-Bedrock*`、`<prefix>-NewApi*`、`<prefix>-WafBlockedSpike` → 邮件 |
+| **异常 API 调用检测**（陌生 IP / 地理 / impossible travel） | Amazon GuardDuty → EventBridge（严重级别 ≥ `guardDutyMinSeverity`）→ SNS 邮件 | GuardDuty 控制台 Findings |
+| **调用模式突变检测** | CloudWatch 异常检测带：调用量、输入 token、输出 token 超出学习到的正常范围（`anomalyBandStdDev` 倍标准差） | 告警 `<prefix>-Anomaly-*`（需要约 2 周历史数据才准确） |
+| **成本突增检测** | AWS Cost Anomaly Detection（按服务，覆盖 Bedrock / EC2 / NAT 等）→ 每日邮件 | Billing → Cost Anomaly Detection |
+
+**账号级设置的处理原则**：Bedrock 调用日志、GuardDuty、按服务成本监控在一个账号（区域）里只能有一份。安全栈用自定义资源“确保存在”：客户已有就复用、不修改；只有本栈创建的才会在删除栈时清理。部署后在输出里看实际状态：
+
+```
+BedrockInvocationLoggingState  MANAGED (configured by this stack) | EXISTING (kept customer configuration)
+GuardDutyState                 MANAGED (created by this stack)    | EXISTING (kept customer detector)
+CostAnomalyState               MANAGED / EXISTING monitor; email=yes|no
+```
+
+注意事项：
+- **只覆盖走 Bedrock 的渠道**，并且只覆盖部署区域（Bedrock 调用日志按区域配置）。如果 new-api 渠道调用的是其他区域的 Bedrock，需要在那个区域也开启；直连 OpenAI / Claude / Gemini 等第三方的渠道，用 new-api 自身的令牌额度 / 使用日志和上游平台的预算告警。
+- **调用身份**是 new-api 渠道使用的 IAM 身份（例如为渠道创建的 IAM 用户），不是最终用户；追溯到具体用户需要结合 new-api 后台的使用日志（令牌、用户、时间、模型）对照。
+- 调用日志包含完整 prompt / 响应，属于敏感数据：日志组用 KMS 加密，读取权限请只授予审计人员。
+- 已有 GuardDuty 的账号，发现结果的发布频率保持客户原设置（新发现总是在约 5 分钟内送达 EventBridge）。
 
 ## AGA 开关说明
 
@@ -156,9 +251,10 @@ npm ci
 | 应用 | 只读根文件系统、init 进程、`TRUSTED_PROXIES` 仅信任 VPC 网段、HTTPS 时启用 `SESSION_COOKIE_SECURE` + `SESSION_COOKIE_TRUSTED_URL`；ECS Exec 默认关闭 |
 | 数据保护 | Aurora 删除保护 + 删除前快照 + 14 天备份 + 跨 AZ reader；Valkey 每日快照 7 天；KMS / 日志 / CRYPTO_SECRET 删除栈时保留 |
 | 可观测 | Container Insights（enhanced）、Aurora PI + 增强监控 + PostgreSQL 日志、告警（ALB 5xx、目标 5xx、不健康主机、CPU/内存、Aurora CPU/ACU）→ SNS |
+| 安全托底 | Bedrock 调用审计、调用告警、异常检测带、GuardDuty、成本异常检测（见上一节） |
 | 合规检查 | 每次 synth 运行 cdk-nag `AwsSolutionsChecks`；所有豁免都在代码中写明理由（见 `lib/*.ts` 中 `acknowledge(...)`） |
 
-账号级建议（不在本模板内）：开启 GuardDuty（含 ECS Runtime Monitoring）、Security Hub、CloudTrail 组织级 Trail、AWS Config。
+账号级建议（不在本模板内）：GuardDuty ECS Runtime Monitoring、Security Hub、CloudTrail 组织级 Trail（长期保留 API 审计）、AWS Config。
 
 ## 运维
 
@@ -181,7 +277,7 @@ aws ecs execute-command --cluster newapi-cluster --task <task-id> --container ne
 ## 删除
 
 ```bash
-./deploy.sh destroy                         # 删除 app 栈
+./deploy.sh destroy                         # 删除 security + app 栈（安全栈只清理本栈创建的账号级设置，客户原有的保留）
 npx cdk destroy newapi-network -c region=us-west-2   # 等 AGA 释放 ENI 后再删
 # 数据栈：确认数据已备份后
 aws cloudformation update-termination-protection --no-enable-termination-protection --stack-name newapi-data --region us-west-2
@@ -197,17 +293,19 @@ app 栈开启了 ALB 删除保护，需要先 `-c albDeletionProtection=false` �
 - Aurora 连接使用 `sslmode=require`（加密但不校验 CA，镜像未内置 RDS CA 包）；如需 `verify-full`，自建镜像加入 RDS CA 证书。
 - new-api 使用非集群模式的 go-redis 客户端；ElastiCache Serverless 提供单一端点，常规单 key 命令 / Lua / 事务均可用，跨 slot 的多 key 命令不支持。
 - 密钥未开启自动轮换（new-api 只在启动时读取连接串）；手工轮换后执行一次 `aws ecs update-service --force-new-deployment`。`CRYPTO_SECRET` 永远不要更改。
-- 成本相关资源：NAT Gateway ×2、接口终端节点 ×5×AZ、AGA（固定费 + 流量）、ALB、WAF（WebACL + 规则 + 请求）、Fargate、Aurora ACU、Valkey ECPU/存储、KMS ×3。请使用 [AWS Pricing Calculator](https://calculator.aws/) 估算；测试环境可设 `natGateways=1`、`enableInterfaceEndpoints=false`。
+- 成本相关资源：NAT Gateway ×2、接口终端节点 ×5×AZ、AGA（固定费 + 流量）、ALB、WAF（WebACL + 规则 + 请求）、Fargate、Aurora ACU、Valkey ECPU/存储、KMS ×4、GuardDuty、Bedrock 调用日志量。请使用 [AWS Pricing Calculator](https://calculator.aws/) 估算；测试环境可设 `natGateways=1`、`enableInterfaceEndpoints=false`。
 
 ## 目录
 
 ```
-bin/new-ecs-cdk.ts     入口：组装 3 个栈 + cdk-nag
+bin/new-ecs-cdk.ts     入口：组装 4 个栈 + cdk-nag
 lib/config.ts          参数定义 / 校验（默认值在 cdk.json context）
 lib/network-stack.ts   VPC / SG / Endpoints / Flow Logs
 lib/data-stack.ts      Aurora / Valkey / Secrets / KMS
 lib/app-stack.ts       ECS / ALB / AGA / DNS / 告警
 lib/waf.ts             WAF WebACL + IP 白名单
+lib/security-stack.ts  安全托底：调用审计 / 告警 / 异常检测 / GuardDuty / 成本异常
+lib/security/handler/  账号级单例的自定义资源（Python，“确保存在”语义）
 lib/nag.ts             cdk-nag 豁免辅助
 scripts/gen-architecture.py  生成 architecture.drawio
 config.local.example.json    环境参数模板（复制为 config.local.json）

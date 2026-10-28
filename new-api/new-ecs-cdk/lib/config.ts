@@ -77,11 +77,47 @@ export interface NewApiConfig {
   readonly valkeyMaxDataStorageGb: number;
   readonly valkeyMaxEcpuPerSecond: number;
 
+  // ---------------- 安全托底（可选栈 <prefix>-security） ----------------
+  /** 是否部署安全托底栈（调用审计 / 调用告警 / 异常检测 / 成本突增 / GuardDuty） */
+  readonly enableSecurityBackstop: boolean;
+  /** Bedrock 调用日志：auto=账号未配置时才开启（不覆盖已有配置）；force=强制覆盖；off=不处理 */
+  readonly bedrockInvocationLogging: 'auto' | 'force' | 'off';
+  /** GuardDuty：auto=没有 detector 才创建，已有则复用并只接入告警；off=不处理 */
+  readonly guardDuty: 'auto' | 'off';
+  /** GuardDuty 告警的最低严重级别（1~8.9，默认 4 = Medium 及以上） */
+  readonly guardDutyMinSeverity: number;
+  /** 成本异常检测（复用账号已有的按服务监控，没有才创建） */
+  readonly costAnomaly: boolean;
+  /** 成本异常告警阈值：单次异常总影响金额（USD） */
+  readonly costAnomalyThresholdUsd: number;
+  /** Bedrock 原生指标告警阈值（每 5 分钟，全模型合计） */
+  readonly bedrockAlarmThresholds: BedrockAlarmThresholds;
+  /** 异常检测带宽度（标准差倍数），越大越不敏感 */
+  readonly anomalyBandStdDev: number;
+
   // ---------------- 运维 ----------------
   readonly logRetentionDays: number;
   /** 告警邮箱（可选） */
   readonly alarmEmail?: string;
 }
+
+export interface BedrockAlarmThresholds {
+  readonly invocations: number;
+  readonly throttles: number;
+  readonly clientErrors: number;
+  readonly serverErrors: number;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+}
+
+const DEFAULT_BEDROCK_THRESHOLDS: BedrockAlarmThresholds = {
+  invocations: 1000,
+  throttles: 10,
+  clientErrors: 50,
+  serverErrors: 10,
+  inputTokens: 1_000_000,
+  outputTokens: 500_000,
+};
 
 function raw(app: App, key: string): unknown {
   return app.node.tryGetContext(key);
@@ -127,6 +163,22 @@ function record(app: App, key: string): Record<string, string> {
   if (v === undefined || v === null || v === '') return {};
   const obj = typeof v === 'string' ? JSON.parse(v) : v;
   return Object.fromEntries(Object.entries(obj as object).map(([k, val]) => [k, String(val)]));
+}
+
+function oneOf<T extends string>(app: App, key: string, allowed: readonly T[], def: T): T {
+  const v = str(app, key, def);
+  if (!(allowed as readonly string[]).includes(v)) throw new Error(`${key} must be one of ${allowed.join(' | ')}, got "${v}"`);
+  return v as T;
+}
+
+function numberRecord(app: App, key: string): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(record(app, key)).map(([k, v]) => {
+      const n = Number(v);
+      if (Number.isNaN(n)) throw new Error(`${key}.${k} must be a number`);
+      return [k, n];
+    }),
+  );
 }
 
 const IPV4_CIDR = /^(\d{1,3}\.){3}\d{1,3}\/(\d|[12]\d|3[0-2])$/;
@@ -216,6 +268,15 @@ export function loadConfig(app: App): NewApiConfig {
     valkeyMaxDataStorageGb: num(app, 'valkeyMaxDataStorageGb', 5),
     valkeyMaxEcpuPerSecond: num(app, 'valkeyMaxEcpuPerSecond', 15000),
 
+    enableSecurityBackstop: bool(app, 'enableSecurityBackstop', true),
+    bedrockInvocationLogging: oneOf(app, 'bedrockInvocationLogging', ['auto', 'force', 'off'], 'auto'),
+    guardDuty: oneOf(app, 'guardDuty', ['auto', 'off'], 'auto'),
+    guardDutyMinSeverity: num(app, 'guardDutyMinSeverity', 4),
+    costAnomaly: bool(app, 'costAnomaly', true),
+    costAnomalyThresholdUsd: num(app, 'costAnomalyThresholdUsd', 100),
+    bedrockAlarmThresholds: { ...DEFAULT_BEDROCK_THRESHOLDS, ...numberRecord(app, 'bedrockAlarmThresholds') },
+    anomalyBandStdDev: num(app, 'anomalyBandStdDev', 4),
+
     logRetentionDays: num(app, 'logRetentionDays', 180),
     alarmEmail: optStr(app, 'alarmEmail'),
   };
@@ -223,6 +284,9 @@ export function loadConfig(app: App): NewApiConfig {
   const allowedRetention = [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653];
   if (!allowedRetention.includes(cfg.logRetentionDays)) {
     throw new Error(`logRetentionDays must be one of ${allowedRetention.join(', ')}`);
+  }
+  if (cfg.guardDutyMinSeverity < 1 || cfg.guardDutyMinSeverity > 8.9) {
+    throw new Error('guardDutyMinSeverity must be between 1 and 8.9');
   }
   if (cfg.workerMinCount < 0 || cfg.workerMaxCount < Math.max(1, cfg.workerMinCount)) {
     throw new Error('workerMaxCount must be >= max(1, workerMinCount)');
