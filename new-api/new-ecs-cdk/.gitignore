@@ -1,0 +1,17 @@
+*.js
+!jest.config.js
+*.d.ts
+node_modules
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+
+# 账号相关的 AZ 查询缓存（模板分发给不同客户时不提交）
+cdk.context.json
+cdk-outputs.json
+# 环境专属参数（域名 / 托管区 / 白名单 IP），不提交
+config.local.json
+
+# 根目录 .gitignore 忽略了 lib/（Python 模板），CDK 源码在 lib/ 下，需要重新包含
+!lib/

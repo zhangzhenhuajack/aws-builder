@@ -1,0 +1,13 @@
+{
+  "domainName": "api.example.com",
+  "hostedZoneId": "Z0123456789ABCDEFGHIJ",
+  "hostedZoneName": "example.com",
+  "wafAllowedIpv4Cidrs": [
+    "203.0.113.10/32"
+  ],
+  "availabilityZones": [
+    "us-west-2b",
+    "us-west-2c"
+  ],
+  "alarmEmail": "ops@example.com"
+}
