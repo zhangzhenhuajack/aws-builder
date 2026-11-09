@@ -73,6 +73,7 @@
 | Route Table × 3 | 1 Public + 2 Private |
 | VPC Endpoint (Bedrock Runtime) | PrivateLink，Bedrock 调用走内网 |
 | VPC Endpoint (Bedrock) | PrivateLink，Bedrock 管理 API 走内网 |
+| VPC Endpoint (Bedrock Mantle) | PrivateLink，OpenAI 兼容端点（GPT 系列 / API key）走内网，可选 |
 | VPC Endpoint (S3 Gateway) | 免费，S3 流量不经 NAT |
 
 ### S3 栈
@@ -144,6 +145,29 @@ chmod +x deploy.sh
 ```
 
 > 💡 **CPU 架构**:任务默认运行在 **ARM64 (Graviton)** 上,获得更好的性价比。若需要切换到 X86_64,在所有 `deploy*` 命令前加 `ARCH=amd64` 环境变量(例如 `ARCH=amd64 ./deploy.sh deploy-all`)。该变量会同时影响:Fargate 任务 `RuntimePlatform`、SSE sidecar 镜像构建平台、以及 CodeBuild 项目类型。
+
+## API Key 网络加固（方案 A，可选）
+
+`BEDROCK_MANTLE_API_KEY` 是一个 Bedrock API key（bearer token），用于 GPT-5.x 走 Bedrock 的 OpenAI 兼容端点（`bedrock-mantle`）。默认情况下，谁拿到这个 token 就能在任何地方用它。方案 A 把它**锁定到 litellm VPC 的 Mantle 接口端点**：token 泄露后，在 VPC 外无法使用。
+
+它由两部分组成：
+
+1. **Mantle 接口 VPC 端点**（`vpc.yaml`，默认创建）——让 API key 流量走内网 PrivateLink，并产生 `aws:SourceVpce` 上下文。
+2. **Deny 策略**（`bedrock.yaml`，默认关闭）——挂到 API key 所属的 IAM user 上，拒绝任何**不经过**该端点的 `bedrock-mantle:CallWithBearerToken` / `bedrock:CallWithBearerToken` 调用。
+
+> ⚠️ **区域必须对齐**：接口端点只能建在 VPC 所在区，私有 DNS 只能拦截**同区**的 `bedrock-mantle.<region>.api.aws`。因此 `litellm_config.yaml` 里 `api_base` 的区域必须等于部署区域 `AWS_REGION`（当前仓库 api_base 为 `us-east-2`）。脚本会在启用前做预检，不一致会直接报错并给出修复建议。
+>
+> ⚠️ **只影响 API key 路径**：Claude 走的是 ECS Task Role 的 SigV4 凭证，不受此策略影响。
+
+```bash
+# 前提：VPC 栈已部署（会自动创建 Mantle 端点）、api_base 区域 == AWS_REGION
+# BEDROCK_API_KEY_IAM_USER = 持有该长期 key 的 IAM 用户名
+AWS_REGION=us-east-2 \
+BEDROCK_API_KEY_IAM_USER=<owning-iam-user> \
+./deploy.sh restrict-mantle-key
+```
+
+验证：从 **VPC 外**用该 key 调用 mantle 端点，应返回 `AccessDeniedException`；VPC 内的 ECS 调用正常。
 
 ## 部署后操作
 

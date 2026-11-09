@@ -86,6 +86,13 @@ SIDECAR_CODEBUILD_ROLE="${SIDECAR_CODEBUILD_ROLE:-${ENVIRONMENT_NAME}-sse-heartb
 # Bedrock Configuration
 BEDROCK_STACK_NAME="${BEDROCK_STACK_NAME:-litellm-bedrock}"
 
+# 方案 A — lock the Bedrock API key (BEDROCK_MANTLE_API_KEY) to the Mantle VPC
+# endpoint. When RESTRICT_MANTLE_KEY=true, the bedrock stack attaches a Deny
+# policy to BEDROCK_API_KEY_IAM_USER so the key only works through the Mantle
+# interface VPC endpoint of the litellm VPC. Both must be set to take effect.
+RESTRICT_MANTLE_KEY="${RESTRICT_MANTLE_KEY:-false}"
+BEDROCK_API_KEY_IAM_USER="${BEDROCK_API_KEY_IAM_USER:-}"
+
 # Bedrock Logging & Alert Configuration
 LOGGING_STACK_NAME="${LOGGING_STACK_NAME:-litellm-bedrock-logging}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-90}"
@@ -291,8 +298,67 @@ deploy_s3() {
 #============================================================
 # Bedrock Deployment (Gateway + API Key)
 #============================================================
+
+# Parse the Bedrock Mantle region from litellm_config.yaml's api_base
+# (e.g. https://bedrock-mantle.us-east-2.api.aws/... -> us-east-2).
+mantle_region_from_config() {
+    grep -oE 'bedrock-mantle\.[a-z0-9-]+\.api\.aws' litellm_config.yaml 2>/dev/null \
+        | head -n1 | sed -E 's/^bedrock-mantle\.([a-z0-9-]+)\.api\.aws$/\1/'
+}
+
+# Read the Mantle VPC endpoint ID from the VPC stack outputs.
+get_mantle_vpce_id() {
+    aws cloudformation describe-stacks \
+        --stack-name "${VPC_STACK_NAME}" \
+        --region "${AWS_REGION}" \
+        --query "Stacks[0].Outputs[?OutputKey=='BedrockMantleEndpointId'].OutputValue" \
+        --output text 2>/dev/null
+}
+
+# Preflight for 方案 A. Validates region alignment + inputs, then echoes the
+# Mantle VPC endpoint ID on success. Aborts (exit 1) with guidance on failure.
+mantle_lock_resolve() {
+    local cfg_region vpce_id
+    cfg_region="$(mantle_region_from_config)"
+    if [[ -z "${cfg_region}" ]]; then
+        log_error "No bedrock-mantle api_base found in litellm_config.yaml — nothing to restrict."
+        exit 1
+    fi
+    if [[ "${cfg_region}" != "${AWS_REGION}" ]]; then
+        log_error "方案 A requires the Mantle interface endpoint in the SAME region as api_base."
+        log_error "  litellm_config.yaml api_base region : ${cfg_region}"
+        log_error "  deploy region (AWS_REGION)          : ${AWS_REGION}"
+        log_error "Fix: deploy with AWS_REGION=${cfg_region}, OR change api_base in"
+        log_error "litellm_config.yaml to bedrock-mantle.${AWS_REGION}.api.aws (if GPT models are offered there)."
+        exit 1
+    fi
+    if [[ -z "${BEDROCK_API_KEY_IAM_USER}" ]]; then
+        log_error "Set BEDROCK_API_KEY_IAM_USER to the IAM user that owns the long-term Bedrock API key."
+        log_error "That is the identity whose service-specific credential is the key (not the ECS task role)."
+        exit 1
+    fi
+    vpce_id="$(get_mantle_vpce_id)"
+    if [[ -z "${vpce_id}" || "${vpce_id}" == "None" ]]; then
+        log_error "Mantle VPC endpoint not found in stack ${VPC_STACK_NAME}."
+        log_error "Deploy the VPC stack first (CreateMantleVpcEndpoint=true): ./deploy.sh deploy-vpc"
+        exit 1
+    fi
+    echo "${vpce_id}"
+}
+
 deploy_bedrock() {
     log_info "Deploying Bedrock stack: ${BEDROCK_STACK_NAME} in region: ${AWS_REGION}"
+
+    # 方案 A: resolve the VPC-lock parameters when enabled.
+    local restrict="false" api_user="" vpce_id=""
+    if [[ "${RESTRICT_MANTLE_KEY}" == "true" ]]; then
+        vpce_id="$(mantle_lock_resolve)"
+        restrict="true"
+        api_user="${BEDROCK_API_KEY_IAM_USER}"
+        log_info "API-key VPC lock (方案 A): ENABLED (user=${api_user}, vpce=${vpce_id})"
+    else
+        log_info "API-key VPC lock (方案 A): disabled (set RESTRICT_MANTLE_KEY=true to enable)"
+    fi
 
     validate_template "bedrock.yaml"
 
@@ -303,6 +369,9 @@ deploy_bedrock() {
         --capabilities CAPABILITY_NAMED_IAM \
         --parameter-overrides \
             EnvironmentName="${ENVIRONMENT_NAME}" \
+            RestrictApiKeyToVpce="${restrict}" \
+            ApiKeyIamUserName="${api_user}" \
+            MantleVpcEndpointId="${vpce_id}" \
         --tags \
             "Project=litellm" \
             "Environment=${ENVIRONMENT_NAME}" \
@@ -311,14 +380,18 @@ deploy_bedrock() {
 
     log_info "Bedrock stack deployment completed!"
     show_outputs "${BEDROCK_STACK_NAME}"
+}
 
+#============================================================
+# 方案 A — Lock the Bedrock API key to the Mantle VPC endpoint
+#============================================================
+restrict_mantle_key() {
+    log_info "方案 A: locking the Bedrock API key to the Mantle VPC endpoint."
+    RESTRICT_MANTLE_KEY="true"
+    deploy_bedrock
     echo ""
-    log_info "Bedrock API Key has been generated and stored in Secrets Manager."
-    log_info "Retrieve it with:"
-    echo "  aws secretsmanager get-secret-value \\"
-    echo "    --secret-id ${ENVIRONMENT_NAME}/litellm/bedrock-api-key \\"
-    echo "    --region ${AWS_REGION} \\"
-    echo "    --query 'SecretString' --output text | jq -r '.AWS_BEARER_TOKEN_BEDROCK'"
+    log_info "Done. The API key now only works through the VPC Mantle endpoint."
+    log_info "Verify from OUTSIDE the VPC — a bearer-token call should now return AccessDeniedException."
 }
 
 #============================================================
@@ -790,6 +863,7 @@ usage() {
     echo "  deploy-s3     Deploy the S3 stack"
     echo "  deploy-ecs    Deploy the ECS stack (Fargate + ALB)"
     echo "  deploy-logging Deploy Bedrock Model Invocation Logging -> CloudWatch + spike alarm"
+    echo "  restrict-mantle-key  Lock the Bedrock API key to the Mantle VPC endpoint (方案 A)"
     echo "  deploy-guardduty Enable GuardDuty anomalous API detection + findings alert (script)"
     echo "  deploy-anomaly Add Bedrock anomaly-detection alarms + cost anomaly detection (script)"
     echo "  deploy-all    Deploy all stacks in order (default)"
@@ -809,6 +883,11 @@ usage() {
     echo "Environment Variables:"
     echo "  ENVIRONMENT_NAME       Environment prefix (default: litellm)"
     echo "  AWS_REGION             AWS region (default: us-east-1)"
+    echo ""
+    echo "  方案 A — API key VPC lock (restrict-mantle-key):"
+    echo "  RESTRICT_MANTLE_KEY       true to lock the API key to the Mantle VPCE (default: false)"
+    echo "  BEDROCK_API_KEY_IAM_USER  IAM user that owns the long-term Bedrock API key (required when locking)"
+    echo "  NOTE: the api_base region in litellm_config.yaml must equal AWS_REGION for the lock to work."
     echo ""
     echo "  VPC:"
     echo "  VPC_STACK_NAME         VPC stack name (default: litellm-vpc)"
@@ -858,6 +937,10 @@ main() {
         deploy-bedrock)
             check_prerequisites
             deploy_bedrock
+            ;;
+        restrict-mantle-key|lock-mantle-key)
+            check_prerequisites
+            restrict_mantle_key
             ;;
         deploy-logging)
             check_prerequisites

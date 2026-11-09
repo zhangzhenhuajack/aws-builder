@@ -9,6 +9,38 @@ Parameters:
     Default: litellm
     Description: Environment name prefix
 
+  RestrictApiKeyToVpce:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      When "true", attach a Deny policy to the IAM user that owns the long-term
+      Bedrock API key (BEDROCK_MANTLE_API_KEY) so the key can only be used when
+      the request enters through the approved VPC interface endpoint. Requires
+      ApiKeyIamUserName and MantleVpcEndpointId to be set.
+
+  ApiKeyIamUserName:
+    Type: String
+    Default: ""
+    Description: >
+      Name of the IAM user that owns the long-term Bedrock API key (the identity
+      whose service-specific credential is the key). The VPC-lock Deny policy is
+      attached to this user. Leave empty to skip.
+
+  MantleVpcEndpointId:
+    Type: String
+    Default: ""
+    Description: >
+      The Bedrock Mantle interface VPC endpoint ID (vpce-xxxx) that API-key calls
+      must traverse. Usually the BedrockMantleEndpointId output of the VPC stack.
+      Leave empty to skip.
+
+Conditions:
+  EnableApiKeyVpceLock: !And
+    - !Equals [!Ref RestrictApiKeyToVpce, "true"]
+    - !Not [!Equals [!Ref ApiKeyIamUserName, ""]]
+    - !Not [!Equals [!Ref MantleVpcEndpointId, ""]]
+
 Resources:
   #============================================================
   # IAM Managed Policy for Bedrock Model Invocation
@@ -26,6 +58,41 @@ Resources:
             Action:
               - bedrock:*
             Resource: '*'
+
+  #============================================================
+  # (Optional) Lock the Bedrock API key to a VPC endpoint — 方案 A
+  #============================================================
+  # The long-term Bedrock API key (BEDROCK_MANTLE_API_KEY) is a bearer token
+  # bound to an IAM user. Its usage is gated by the IAM actions
+  # bedrock-mantle:CallWithBearerToken (Mantle / OpenAI-compatible endpoint) and
+  # bedrock:CallWithBearerToken (Bedrock endpoint). This Deny statement blocks
+  # those bearer-token calls UNLESS the request enters through the approved VPC
+  # interface endpoint, so a leaked key cannot be used from outside the VPC.
+  #
+  # NOTE: this does NOT affect the ECS Task Role's Claude access — that path uses
+  # SigV4 IAM credentials, for which CallWithBearerToken is never evaluated.
+  ApiKeyVpceLockPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: EnableApiKeyVpceLock
+    Properties:
+      ManagedPolicyName: !Sub ${EnvironmentName}-bedrock-apikey-vpce-lock
+      Description: >
+        Deny Bedrock API key (bearer token) usage unless the request enters
+        through the approved VPC interface endpoint.
+      Users:
+        - !Ref ApiKeyIamUserName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyBearerTokenOutsideVpce
+            Effect: Deny
+            Action:
+              - bedrock-mantle:CallWithBearerToken
+              - bedrock:CallWithBearerToken
+            Resource: '*'
+            Condition:
+              StringNotEquals:
+                aws:SourceVpce: !Ref MantleVpcEndpointId
 
 #============================================================
 # Outputs
@@ -52,3 +119,10 @@ Outputs:
   HowItWorks:
     Description: How Bedrock auth works with ECS
     Value: "ECS Task Role has this policy attached. LiteLLM auto-detects IAM credentials from the task metadata endpoint. No API keys needed."
+
+  ApiKeyVpceLock:
+    Description: Whether the Bedrock API key is locked to a VPC endpoint (方案 A)
+    Value: !If
+      - EnableApiKeyVpceLock
+      - !Sub "ENABLED — user ${ApiKeyIamUserName} can only use the API key via ${MantleVpcEndpointId}"
+      - "DISABLED — API key usable from anywhere the token is presented"

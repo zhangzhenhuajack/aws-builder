@@ -34,6 +34,20 @@ Parameters:
     Default: 10.0.20.0/24
     Description: CIDR block for Private Subnet 2
 
+  CreateMantleVpcEndpoint:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Create an interface VPC endpoint for the Bedrock Mantle (OpenAI-compatible)
+      endpoint so the BEDROCK_MANTLE_API_KEY traffic stays on the private network.
+      Set to "false" if the Mantle endpoint service is not available in this region.
+      NOTE: the endpoint is created in THIS stack's region. For private DNS to
+      intercept calls, litellm_config.yaml's api_base region must match this region.
+
+Conditions:
+  ShouldCreateMantleEndpoint: !Equals [!Ref CreateMantleVpcEndpoint, "true"]
+
 Resources:
   #============================================================
   # VPC
@@ -279,6 +293,27 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-bedrock-vpce
 
+  # Bedrock Mantle (OpenAI-compatible) interface endpoint.
+  # Enables the BEDROCK_MANTLE_API_KEY (bearer token) traffic to reach Bedrock
+  # privately and populates aws:SourceVpce, which bedrock.yaml uses to lock the
+  # API key to this VPC. Only created when CreateMantleVpcEndpoint == "true".
+  BedrockMantleEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateMantleEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.bedrock-mantle
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref BedrockEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-bedrock-mantle-vpce
+
   # S3 Gateway Endpoint (free, no NAT needed for S3)
   S3Endpoint:
     Type: AWS::EC2::VPCEndpoint
@@ -360,6 +395,13 @@ Outputs:
     Value: !Ref BedrockEndpoint
     Export:
       Name: !Sub ${EnvironmentName}-BedrockVPCE
+
+  BedrockMantleEndpointId:
+    Condition: ShouldCreateMantleEndpoint
+    Description: Bedrock Mantle (OpenAI-compatible) VPC Endpoint ID (PrivateLink)
+    Value: !Ref BedrockMantleEndpoint
+    Export:
+      Name: !Sub ${EnvironmentName}-BedrockMantleVPCE
 
   S3EndpointId:
     Description: S3 Gateway Endpoint ID (free)
