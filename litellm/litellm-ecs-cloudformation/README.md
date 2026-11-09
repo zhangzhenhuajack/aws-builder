@@ -73,6 +73,7 @@
 | Route Table × 3 | 1 Public + 2 Private |
 | VPC Endpoint (Bedrock Runtime) | PrivateLink，Bedrock 调用走内网 |
 | VPC Endpoint (Bedrock) | PrivateLink，Bedrock 管理 API 走内网 |
+| VPC Endpoint (Bedrock Mantle) | PrivateLink，可选（默认不建），仅 mantle API key 路径使用 |
 | VPC Endpoint (S3 Gateway) | 免费，S3 流量不经 NAT |
 
 ### S3 栈
@@ -143,7 +144,44 @@ chmod +x deploy.sh
 ./deploy.sh deploy-cloudfront   # 可选
 ```
 
+> ⚠️ **部署 CloudFront 后，强烈建议立刻开启源 IP 白名单**（WAF deny-all），否则 `/ui` 和 `/v1/*` 对整个互联网开放。步骤见 [部署后操作 → 第 2 步后的警告](#2-获取-cloudfront-访问地址)。
+
 > 💡 **CPU 架构**:任务默认运行在 **ARM64 (Graviton)** 上,获得更好的性价比。若需要切换到 X86_64,在所有 `deploy*` 命令前加 `ARCH=amd64` 环境变量(例如 `ARCH=amd64 ./deploy.sh deploy-all`)。该变量会同时影响:Fargate 任务 `RuntimePlatform`、SSE sidecar 镜像构建平台、以及 CodeBuild 项目类型。
+
+## Bedrock 模型访问方式
+
+**默认（推荐）：bedrock-runtime + ECS Task Role。** Claude 和 GPT-5.x 都通过 `bedrock/...` 路由调用 bedrock-runtime，认证用 ECS Task Role 的 SigV4 临时凭证，流量走 `vpc.yaml` 里的 bedrock-runtime PrivateLink 端点。不需要创建、存储或轮换任何 API key。
+
+```yaml
+- model_name: gpt-5.5
+  litellm_params:
+    model: bedrock/us.openai.gpt-5.5   # 必须用 us./global. 推理配置文件 ID
+```
+
+> 在 LiteLLM v1.108.3 上实测：`/v1/chat/completions`（含 stream、tool calling）和 `/v1/responses` 都可用。`bedrock/chat_completions/` 前缀（原生 Chat Completions 路由）在 v1.108.3 上也可用，但在 v1.89.0 上会报 `Checksum mismatch`。
+
+**可选：bedrock-mantle + Bedrock API key。** 只有当某个模型或功能只在 bedrock-mantle 上提供时才用。需要一个**长期** Bedrock API key（`ABSK` 开头）。短期 key（`bedrock-api-key-...`）最多 12 小时就过期，之后返回 401 `Signature expired`。
+
+```bash
+ENABLE_MANTLE=true ./deploy.sh deploy-ecs                                   # 创建 secret 并注入 BEDROCK_MANTLE_API_KEY
+ENABLE_MANTLE=true BEDROCK_MANTLE_API_KEY=ABSK... ./deploy.sh upload-mantle-key
+# 然后取消 litellm_config.yaml 里 gpt-5.5-mantle 示例的注释，再 ./deploy.sh upload-config
+```
+
+### 方案 A：把 mantle API key 锁定到 VPC（可选，仅 mantle 路径）
+
+启用 mantle 路径后，可以把 key 锁定到 litellm VPC 的 Mantle 接口端点，key 泄露后在 VPC 外无法使用：
+
+1. **Mantle 接口 VPC 端点**（`vpc.yaml`，`CreateMantleVpcEndpoint`，默认 `false`，约 $15/月）：让 API key 流量走 PrivateLink，并产生 `aws:SourceVpce` 上下文。
+2. **Deny 策略**（`bedrock.yaml`，默认关闭）：挂到 API key 所属的 IAM user 上，拒绝所有**不经过**该端点的 `bedrock-mantle:CallWithBearerToken` / `bedrock:CallWithBearerToken` 调用。
+
+> ⚠️ **区域必须对齐**：接口端点只能建在 VPC 所在区，私有 DNS 只能拦截**同区**的 `bedrock-mantle.<region>.api.aws`。因此 mantle `api_base` 的区域必须等于 `AWS_REGION`。脚本启用前会预检。
+
+```bash
+AWS_REGION=us-east-2 ENABLE_MANTLE=true \
+BEDROCK_API_KEY_IAM_USER=<owning-iam-user> \
+./deploy.sh restrict-mantle-key
+```
 
 ## 部署后操作
 
@@ -165,7 +203,25 @@ aws cloudformation describe-stacks \
   --output text
 ```
 > 完成步骤 1、2 后，访问 CloudFront 地址的 `/ui` 路径，使用 `admin` 和 Master Key 作为密码登录即可使用。
->步骤 3、4 为后续运维按需执行。 
+>步骤 3、4 为后续运维按需执行。
+
+> [!WARNING]
+> **强烈建议：在把地址或 key 发给任何人之前，先开启源 IP 白名单（WAF deny-all 模式）。**
+>
+> CloudFront + WAF 栈部署完后，WAF 默认是 **allow-all**：互联网上任何 IP 都能访问 `/ui` 管理后台和 `/v1/*` 模型 API。托管规则和单 IP 速率限制只能拦截已知的恶意请求，挡不住拿着有效 key 的请求。Master Key 或虚拟 key 一旦泄露，任何人都可以用你账号的 Bedrock 额度调用模型，费用记在你的账单上。
+>
+> 开启 deny-all 后，只有白名单里的出口 IP 能访问，其他请求在 CloudFront 边缘直接返回 403，不会到达 LiteLLM。即使 key 泄露，白名单外也用不了。
+>
+> ```bash
+> curl -s https://checkip.amazonaws.com                      # 查看本机出口 IP
+> ./manage-waf-ip-whitelist.sh add <你的出口IP>/32            # 加入白名单（公司网络可加整个出口网段）
+> ./manage-waf-ip-whitelist.sh attach                        # 把白名单规则挂到 WebACL（只需一次）
+> ./manage-waf-ip-whitelist.sh mode deny-all                 # 开启：只允许白名单 IP
+> ./manage-waf-ip-whitelist.sh status                        # 确认“当前模式: deny-all”
+> ```
+>
+> 详细用法和紧急恢复见下文 [5. WAF IP 白名单管理](#5-waf-ip-白名单管理)。
+
 ### 3. 获取数据库密码 (可选)
 
 ```bash
@@ -187,7 +243,18 @@ aws ecs update-service --cluster litellm-ecs-cluster \
 
 ### 5. WAF IP 白名单管理
 
+> **强烈建议在生产和对外环境开启 deny-all 模式**（原因见上文第 2 步后的警告）。allow-all 只适合短时间排障。
+
 提供独立脚本 `manage-waf-ip-whitelist.sh` 管理 WAF IP 白名单，支持 deny-all 模式（仅允许白名单 IP 访问）和 allow-all 模式（默认放行，仅拦截恶意请求）。
+
+注意：只执行 `attach` 不会拦截任何请求。`IPWhitelist` 规则的动作是 Allow，白名单外的 IP 仍会走默认动作。必须执行 `mode deny-all`，白名单才真正生效。
+
+#### 使用注意
+
+- **出口 IP 会变化**：家庭宽带、手机热点、部分公司 VPN 的出口 IP 不固定。访问突然变成 403 时，先重新执行 `curl -s https://checkip.amazonaws.com`，再 `add` 新 IP。
+- **以 WAF 看到的 IP 为准**：经过代理或 VPN 时，`checkip` 返回的 IP 可能和 WAF 看到的源 IP 不同。白名单内的客户端仍然 403 时，到 WAF 控制台 → Web ACL `litellm-waf` → Sampled requests 查看被拦请求的实际源 IP。
+- **白名单尽量精确**：单个 IP 用 `/32`。不要加 `0.0.0.0/0` 或云厂商的大网段，否则白名单形同虚设。
+- **服务端调用方也要加**：如果有 CI、服务器或其他 VPC 通过 CloudFront 调用 API，要把它们的 NAT/EIP 出口 IP 也加进白名单。
 
 #### 首次配置
 
@@ -308,7 +375,7 @@ chmod +x manage-waf-ip-whitelist.sh
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `ECS_STACK_NAME` | litellm-ecs | 栈名称 |
-| `LITELLM_IMAGE` | docker.litellm.ai/berriai/litellm:v1.89.0 | Docker 镜像（默认 tag 同时发布 amd64 / arm64 manifest） |
+| `LITELLM_IMAGE` | docker.litellm.ai/berriai/litellm:v1.108.3 | Docker 镜像（默认 tag 同时发布 amd64 / arm64 manifest） |
 | `ARCH` | arm64 | Fargate 任务 CPU 架构。`arm64` 跑在 Graviton 上,价格/性能更优;若要切回 x86 设 `ARCH=amd64`(同时影响 sidecar 镜像构建平台和 CodeBuild 容器类型)。 |
 | `TASK_CPU` | 2048 | CPU 单位 (2 vCPU) |
 | `TASK_MEMORY` | 4096 | 内存 (4 GB) |
@@ -697,7 +764,7 @@ aws ecs describe-task-definition \
 # 同一 tag 通常同时发布 linux/amd64 与 linux/arm64 manifest。
 
 # 3. 升级到指定版本
-LITELLM_IMAGE=docker.litellm.ai/berriai/litellm:v1.89.0 ./deploy.sh deploy-ecs
+LITELLM_IMAGE=docker.litellm.ai/berriai/litellm:v1.108.3 ./deploy.sh deploy-ecs
 
 # 3a. 切换到 X86_64 (Graviton 不可用或需要 x86-only 镜像时)
 ARCH=amd64 ./deploy.sh deploy-ecs
