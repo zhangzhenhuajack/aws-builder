@@ -49,7 +49,7 @@
 | `vpc.yaml` | litellm-vpc | VPC 网络基础设施 |
 | `s3.yaml` | litellm-s3 | S3 存储桶（配置文件 + 日志） |
 | `database.yaml` | litellm-database | Aurora PostgreSQL + Redis + DynamoDB |
-| `bedrock.yaml` | litellm-bedrock | Bedrock IAM 用户 + 凭证 |
+| `bedrock.yaml` | litellm-bedrock | Bedrock 调用 IAM 策略（附加到 ECS Task Role） |
 | `bedrock-logging.yaml` | litellm-bedrock-logging | Bedrock 调用日志(→CloudWatch) + 全类型告警 + SNS（安全托底） |
 | `ecs.yaml` | litellm-ecs | ECS Fargate + Internal ALB + Auto Scaling |
 | `cloudfront-waf.yaml` | litellm-cloudfront | CloudFront + WAF（可选） |
@@ -73,7 +73,6 @@
 | Route Table × 3 | 1 Public + 2 Private |
 | VPC Endpoint (Bedrock Runtime) | PrivateLink，Bedrock 调用走内网 |
 | VPC Endpoint (Bedrock) | PrivateLink，Bedrock 管理 API 走内网 |
-| VPC Endpoint (Bedrock Mantle) | PrivateLink，可选（默认不建），仅 mantle API key 路径使用 |
 | VPC Endpoint (S3 Gateway) | 免费，S3 流量不经 NAT |
 
 ### S3 栈
@@ -95,9 +94,7 @@
 ### Bedrock 栈
 | 资源 | 说明 |
 |------|------|
-| IAM User | 专用 Bedrock 访问用户 |
-| IAM Access Key | 自动生成，存入 Secrets Manager |
-| IAM Managed Policy | Bedrock 模型调用权限（可附加到 ECS Task Role） |
+| IAM Managed Policy | Bedrock 模型调用权限，附加到 ECS Task Role（Claude 和 GPT-5.x 都用它，无 API key） |
 
 ### ECS 栈
 | 资源 | 说明 |
@@ -150,7 +147,7 @@ chmod +x deploy.sh
 
 ## Bedrock 模型访问方式
 
-**默认（推荐）：bedrock-runtime + ECS Task Role。** Claude 和 GPT-5.x 都通过 `bedrock/...` 路由调用 bedrock-runtime，认证用 ECS Task Role 的 SigV4 临时凭证，流量走 `vpc.yaml` 里的 bedrock-runtime PrivateLink 端点。不需要创建、存储或轮换任何 API key。
+所有模型（Claude 和 GPT-5.x）都通过 `bedrock/...` 路由调用 bedrock-runtime，认证用 ECS Task Role 的 SigV4 临时凭证，流量走 `vpc.yaml` 里的 bedrock-runtime PrivateLink 端点。部署过程中不会创建、存储或轮换任何 Bedrock API key。
 
 ```yaml
 - model_name: gpt-5.5
@@ -159,29 +156,6 @@ chmod +x deploy.sh
 ```
 
 > 在 LiteLLM v1.108.3 上实测：`/v1/chat/completions`（含 stream、tool calling）和 `/v1/responses` 都可用。`bedrock/chat_completions/` 前缀（原生 Chat Completions 路由）在 v1.108.3 上也可用，但在 v1.89.0 上会报 `Checksum mismatch`。
-
-**可选：bedrock-mantle + Bedrock API key。** 只有当某个模型或功能只在 bedrock-mantle 上提供时才用。需要一个**长期** Bedrock API key（`ABSK` 开头）。短期 key（`bedrock-api-key-...`）最多 12 小时就过期，之后返回 401 `Signature expired`。
-
-```bash
-ENABLE_MANTLE=true ./deploy.sh deploy-ecs                                   # 创建 secret 并注入 BEDROCK_MANTLE_API_KEY
-ENABLE_MANTLE=true BEDROCK_MANTLE_API_KEY=ABSK... ./deploy.sh upload-mantle-key
-# 然后取消 litellm_config.yaml 里 gpt-5.5-mantle 示例的注释，再 ./deploy.sh upload-config
-```
-
-### 方案 A：把 mantle API key 锁定到 VPC（可选，仅 mantle 路径）
-
-启用 mantle 路径后，可以把 key 锁定到 litellm VPC 的 Mantle 接口端点，key 泄露后在 VPC 外无法使用：
-
-1. **Mantle 接口 VPC 端点**（`vpc.yaml`，`CreateMantleVpcEndpoint`，默认 `false`，约 $15/月）：让 API key 流量走 PrivateLink，并产生 `aws:SourceVpce` 上下文。
-2. **Deny 策略**（`bedrock.yaml`，默认关闭）：挂到 API key 所属的 IAM user 上，拒绝所有**不经过**该端点的 `bedrock-mantle:CallWithBearerToken` / `bedrock:CallWithBearerToken` 调用。
-
-> ⚠️ **区域必须对齐**：接口端点只能建在 VPC 所在区，私有 DNS 只能拦截**同区**的 `bedrock-mantle.<region>.api.aws`。因此 mantle `api_base` 的区域必须等于 `AWS_REGION`。脚本启用前会预检。
-
-```bash
-AWS_REGION=us-east-2 ENABLE_MANTLE=true \
-BEDROCK_API_KEY_IAM_USER=<owning-iam-user> \
-./deploy.sh restrict-mantle-key
-```
 
 ## 部署后操作
 
