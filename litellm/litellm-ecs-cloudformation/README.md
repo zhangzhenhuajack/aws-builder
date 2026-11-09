@@ -144,6 +144,8 @@ chmod +x deploy.sh
 ./deploy.sh deploy-cloudfront   # 可选
 ```
 
+> ⚠️ **部署 CloudFront 后，强烈建议立刻开启源 IP 白名单**（WAF deny-all），否则 `/ui` 和 `/v1/*` 对整个互联网开放。步骤见 [部署后操作 → 第 2 步后的警告](#2-获取-cloudfront-访问地址)。
+
 > 💡 **CPU 架构**:任务默认运行在 **ARM64 (Graviton)** 上,获得更好的性价比。若需要切换到 X86_64,在所有 `deploy*` 命令前加 `ARCH=amd64` 环境变量(例如 `ARCH=amd64 ./deploy.sh deploy-all`)。该变量会同时影响:Fargate 任务 `RuntimePlatform`、SSE sidecar 镜像构建平台、以及 CodeBuild 项目类型。
 
 ## Bedrock 模型访问方式
@@ -201,7 +203,25 @@ aws cloudformation describe-stacks \
   --output text
 ```
 > 完成步骤 1、2 后，访问 CloudFront 地址的 `/ui` 路径，使用 `admin` 和 Master Key 作为密码登录即可使用。
->步骤 3、4 为后续运维按需执行。 
+>步骤 3、4 为后续运维按需执行。
+
+> [!WARNING]
+> **强烈建议：在把地址或 key 发给任何人之前，先开启源 IP 白名单（WAF deny-all 模式）。**
+>
+> CloudFront + WAF 栈部署完后，WAF 默认是 **allow-all**：互联网上任何 IP 都能访问 `/ui` 管理后台和 `/v1/*` 模型 API。托管规则和单 IP 速率限制只能拦截已知的恶意请求，挡不住拿着有效 key 的请求。Master Key 或虚拟 key 一旦泄露，任何人都可以用你账号的 Bedrock 额度调用模型，费用记在你的账单上。
+>
+> 开启 deny-all 后，只有白名单里的出口 IP 能访问，其他请求在 CloudFront 边缘直接返回 403，不会到达 LiteLLM。即使 key 泄露，白名单外也用不了。
+>
+> ```bash
+> curl -s https://checkip.amazonaws.com                      # 查看本机出口 IP
+> ./manage-waf-ip-whitelist.sh add <你的出口IP>/32            # 加入白名单（公司网络可加整个出口网段）
+> ./manage-waf-ip-whitelist.sh attach                        # 把白名单规则挂到 WebACL（只需一次）
+> ./manage-waf-ip-whitelist.sh mode deny-all                 # 开启：只允许白名单 IP
+> ./manage-waf-ip-whitelist.sh status                        # 确认“当前模式: deny-all”
+> ```
+>
+> 详细用法和紧急恢复见下文 [5. WAF IP 白名单管理](#5-waf-ip-白名单管理)。
+
 ### 3. 获取数据库密码 (可选)
 
 ```bash
@@ -223,7 +243,18 @@ aws ecs update-service --cluster litellm-ecs-cluster \
 
 ### 5. WAF IP 白名单管理
 
+> **强烈建议在生产和对外环境开启 deny-all 模式**（原因见上文第 2 步后的警告）。allow-all 只适合短时间排障。
+
 提供独立脚本 `manage-waf-ip-whitelist.sh` 管理 WAF IP 白名单，支持 deny-all 模式（仅允许白名单 IP 访问）和 allow-all 模式（默认放行，仅拦截恶意请求）。
+
+注意：只执行 `attach` 不会拦截任何请求。`IPWhitelist` 规则的动作是 Allow，白名单外的 IP 仍会走默认动作。必须执行 `mode deny-all`，白名单才真正生效。
+
+#### 使用注意
+
+- **出口 IP 会变化**：家庭宽带、手机热点、部分公司 VPN 的出口 IP 不固定。访问突然变成 403 时，先重新执行 `curl -s https://checkip.amazonaws.com`，再 `add` 新 IP。
+- **以 WAF 看到的 IP 为准**：经过代理或 VPN 时，`checkip` 返回的 IP 可能和 WAF 看到的源 IP 不同。白名单内的客户端仍然 403 时，到 WAF 控制台 → Web ACL `litellm-waf` → Sampled requests 查看被拦请求的实际源 IP。
+- **白名单尽量精确**：单个 IP 用 `/32`。不要加 `0.0.0.0/0` 或云厂商的大网段，否则白名单形同虚设。
+- **服务端调用方也要加**：如果有 CI、服务器或其他 VPC 通过 CloudFront 调用 API，要把它们的 NAT/EIP 出口 IP 也加进白名单。
 
 #### 首次配置
 
