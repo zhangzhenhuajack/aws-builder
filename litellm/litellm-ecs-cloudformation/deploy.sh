@@ -31,7 +31,7 @@ S3_STACK_NAME="${S3_STACK_NAME:-litellm-s3}"
 
 # ECS Configuration
 ECS_STACK_NAME="${ECS_STACK_NAME:-litellm-ecs}"
-LITELLM_IMAGE="${LITELLM_IMAGE:-docker.litellm.ai/berriai/litellm:v1.89.0}"
+LITELLM_IMAGE="${LITELLM_IMAGE:-docker.litellm.ai/berriai/litellm:v1.108.3}"
 TASK_CPU="${TASK_CPU:-2048}"
 TASK_MEMORY="${TASK_MEMORY:-4096}"
 DESIRED_COUNT="${DESIRED_COUNT:-2}"

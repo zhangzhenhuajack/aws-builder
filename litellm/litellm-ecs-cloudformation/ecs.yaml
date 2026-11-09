@@ -11,7 +11,7 @@ Parameters:
 
   LiteLLMImage:
     Type: String
-    Default: docker.litellm.ai/berriai/litellm:v1.89.0
+    Default: docker.litellm.ai/berriai/litellm:v1.108.3
     Description: >
       LiteLLM Docker image. Default tag publishes both linux/amd64 and
       linux/arm64 manifests, so it works with the CpuArchitecture parameter

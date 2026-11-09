@@ -23,9 +23,10 @@ model_list:
   # traffic uses the bedrock-runtime PrivateLink endpoint in vpc.yaml.
   # Must use the `us.` inference profile; the bare `openai.gpt-5.5` id is
   # INFERENCE_PROFILE-only and is not callable on demand.
-  # Verified on LiteLLM v1.89.0: /v1/chat/completions (incl. stream + tools)
-  # and /v1/responses both work. Don't use `bedrock/chat_completions/` for
-  # these ids on v1.89.0 (fails with "Checksum mismatch").
+  # Verified on LiteLLM v1.108.3: /v1/chat/completions (incl. stream + tools)
+  # and /v1/responses both work on this Converse route. The native
+  # `bedrock/chat_completions/` prefix also works on v1.108.3 (it failed with
+  # "Checksum mismatch" on v1.89.0).
   - model_name: gpt-5.5
     litellm_params:
       model: bedrock/us.openai.gpt-5.5

@@ -156,7 +156,7 @@ chmod +x deploy.sh
     model: bedrock/us.openai.gpt-5.5   # 必须用 us./global. 推理配置文件 ID
 ```
 
-> 在 LiteLLM v1.89.0 上实测：`/v1/chat/completions`（含 stream、tool calling）和 `/v1/responses` 都可用。不要对这些 ID 使用 `bedrock/chat_completions/` 前缀，在 v1.89.0 上会报 `Checksum mismatch`。
+> 在 LiteLLM v1.108.3 上实测：`/v1/chat/completions`（含 stream、tool calling）和 `/v1/responses` 都可用。`bedrock/chat_completions/` 前缀（原生 Chat Completions 路由）在 v1.108.3 上也可用，但在 v1.89.0 上会报 `Checksum mismatch`。
 
 **可选：bedrock-mantle + Bedrock API key。** 只有当某个模型或功能只在 bedrock-mantle 上提供时才用。需要一个**长期** Bedrock API key（`ABSK` 开头）。短期 key（`bedrock-api-key-...`）最多 12 小时就过期，之后返回 401 `Signature expired`。
 
@@ -344,7 +344,7 @@ chmod +x manage-waf-ip-whitelist.sh
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `ECS_STACK_NAME` | litellm-ecs | 栈名称 |
-| `LITELLM_IMAGE` | docker.litellm.ai/berriai/litellm:v1.89.0 | Docker 镜像（默认 tag 同时发布 amd64 / arm64 manifest） |
+| `LITELLM_IMAGE` | docker.litellm.ai/berriai/litellm:v1.108.3 | Docker 镜像（默认 tag 同时发布 amd64 / arm64 manifest） |
 | `ARCH` | arm64 | Fargate 任务 CPU 架构。`arm64` 跑在 Graviton 上,价格/性能更优;若要切回 x86 设 `ARCH=amd64`(同时影响 sidecar 镜像构建平台和 CodeBuild 容器类型)。 |
 | `TASK_CPU` | 2048 | CPU 单位 (2 vCPU) |
 | `TASK_MEMORY` | 4096 | 内存 (4 GB) |
@@ -733,7 +733,7 @@ aws ecs describe-task-definition \
 # 同一 tag 通常同时发布 linux/amd64 与 linux/arm64 manifest。
 
 # 3. 升级到指定版本
-LITELLM_IMAGE=docker.litellm.ai/berriai/litellm:v1.89.0 ./deploy.sh deploy-ecs
+LITELLM_IMAGE=docker.litellm.ai/berriai/litellm:v1.108.3 ./deploy.sh deploy-ecs
 
 # 3a. 切换到 X86_64 (Graviton 不可用或需要 x86-only 镜像时)
 ARCH=amd64 ./deploy.sh deploy-ecs
