@@ -19,7 +19,7 @@ model_list:
       additional_drop_params: ["client_metadata", "metadata"]
 
   # GPT-5.5 / GPT-5.4 — bedrock-runtime (Converse) with the ECS Task Role.
-  # No API key: auth is the task role's SigV4 credentials, same as Claude, and
+  # Auth is the task role's SigV4 credentials, same as Claude, and
   # traffic uses the bedrock-runtime PrivateLink endpoint in vpc.yaml.
   # Must use the `us.` inference profile; the bare `openai.gpt-5.5` id is
   # INFERENCE_PROFILE-only and is not callable on demand.
@@ -40,23 +40,6 @@ model_list:
       timeout: 900
       drop_params: true
       additional_drop_params: ["client_metadata", "metadata"]
-
-  # ── Optional: bedrock-mantle endpoint (Bedrock API key) ──────────────────
-  # Only for a model/feature that bedrock-runtime doesn't offer. Requires
-  # ENABLE_MANTLE=true and a LONG-TERM Bedrock API key (starts with "ABSK"):
-  #   ENABLE_MANTLE=true BEDROCK_MANTLE_API_KEY=ABSK... ./deploy.sh deploy-ecs
-  #   ENABLE_MANTLE=true BEDROCK_MANTLE_API_KEY=ABSK... ./deploy.sh upload-mantle-key
-  # Short-term keys (bedrock-api-key-..., max 12h) expire and return 401
-  # "Signature expired".
-  #
-  # - model_name: gpt-5.5-mantle
-  #   litellm_params:
-  #     model: openai/openai.gpt-5.5
-  #     api_base: https://bedrock-mantle.us-east-2.api.aws/openai/v1
-  #     api_key: os.environ/BEDROCK_MANTLE_API_KEY
-  #     timeout: 900
-  #     drop_params: true
-  #     additional_drop_params: ["client_metadata", "metadata"]
 
 general_settings:
   database_url: os.environ/DATABASE_URL
