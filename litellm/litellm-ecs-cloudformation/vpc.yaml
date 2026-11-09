@@ -36,14 +36,15 @@ Parameters:
 
   CreateMantleVpcEndpoint:
     Type: String
-    Default: "true"
+    Default: "false"
     AllowedValues: ["true", "false"]
     Description: >
-      Create an interface VPC endpoint for the Bedrock Mantle (OpenAI-compatible)
-      endpoint so the BEDROCK_MANTLE_API_KEY traffic stays on the private network.
-      Set to "false" if the Mantle endpoint service is not available in this region.
+      Optional. Create an interface VPC endpoint for the bedrock-mantle
+      (OpenAI-compatible) endpoint. Only needed when ENABLE_MANTLE is used for
+      models that bedrock-runtime doesn't serve; the default role-based path
+      goes through the bedrock-runtime endpoint below.
       NOTE: the endpoint is created in THIS stack's region. For private DNS to
-      intercept calls, litellm_config.yaml's api_base region must match this region.
+      intercept calls, the mantle api_base region must match this region.
 
 Conditions:
   ShouldCreateMantleEndpoint: !Equals [!Ref CreateMantleVpcEndpoint, "true"]

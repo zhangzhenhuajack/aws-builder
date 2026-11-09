@@ -14,10 +14,11 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: >
-      When "true", attach a Deny policy to the IAM user that owns the long-term
-      Bedrock API key (BEDROCK_MANTLE_API_KEY) so the key can only be used when
-      the request enters through the approved VPC interface endpoint. Requires
-      ApiKeyIamUserName and MantleVpcEndpointId to be set.
+      Optional, only used with ENABLE_MANTLE. When "true", attach a Deny policy
+      to the IAM user that owns the long-term Bedrock API key
+      (BEDROCK_MANTLE_API_KEY) so the key only works when the request enters
+      through the approved VPC interface endpoint. Requires ApiKeyIamUserName
+      and MantleVpcEndpointId.
 
   ApiKeyIamUserName:
     Type: String
@@ -49,7 +50,10 @@ Resources:
     Type: AWS::IAM::ManagedPolicy
     Properties:
       ManagedPolicyName: !Sub ${EnvironmentName}-bedrock-invoke-policy
-      Description: !Sub "Policy for ${EnvironmentName} ECS tasks to access Bedrock (full access)"
+      # Keep this Description unchanged. On AWS::IAM::ManagedPolicy a Description
+      # change requires REPLACEMENT, which fails with a fixed ManagedPolicyName
+      # ("already exists") and is blocked anyway while litellm-ecs imports the ARN.
+      Description: !Sub "Policy for ${EnvironmentName} ECS tasks to invoke Bedrock models via IAM Role"
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -118,7 +122,7 @@ Outputs:
 
   HowItWorks:
     Description: How Bedrock auth works with ECS
-    Value: "ECS Task Role has this policy attached. LiteLLM auto-detects IAM credentials from the task metadata endpoint. No API keys needed."
+    Value: "ECS Task Role has this policy attached. LiteLLM auto-detects IAM credentials from the task metadata endpoint. Claude and GPT-5.x both use it; no API keys needed."
 
   ApiKeyVpceLock:
     Description: Whether the Bedrock API key is locked to a VPC endpoint (方案 A)

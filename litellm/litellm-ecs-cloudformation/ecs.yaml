@@ -75,8 +75,19 @@ Parameters:
     Default: 8080
     Description: Port the heartbeat sidecar listens on (ALB target when sidecar is enabled)
 
+  EnableMantleApiKey:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Optional. "true" creates the Secrets Manager secret for a long-term Bedrock
+      API key and injects it as BEDROCK_MANTLE_API_KEY, for models that are only
+      reachable on the bedrock-mantle endpoint. Default "false": every model
+      (Claude and GPT-5.x) is called on bedrock-runtime with the ECS Task Role.
+
 Conditions:
   HasSidecar: !Not [!Equals [!Ref SidecarImage, '']]
+  HasMantleApiKey: !Equals [!Ref EnableMantleApiKey, "true"]
 
 Resources:
   #============================================================
@@ -100,10 +111,11 @@ Resources:
           Value: !Ref EnvironmentName
 
   #============================================================
-  # Secrets Manager - Bedrock Mantle API Key
+  # Secrets Manager - Bedrock Mantle API Key (optional)
   #============================================================
   BedrockMantleApiKeySecret:
     Type: AWS::SecretsManager::Secret
+    Condition: HasMantleApiKey
     Properties:
       Name: !Sub ${EnvironmentName}/litellm/bedrock-mantle-api-key
       Description: Bedrock Mantle API Key for OpenAI-compatible GPT models
@@ -158,7 +170,7 @@ Resources:
                   - secretsmanager:GetSecretValue
                 Resource:
                   - !Ref MasterKeySecret
-                  - !Ref BedrockMantleApiKeySecret
+                  - !If [HasMantleApiKey, !Ref BedrockMantleApiKeySecret, !Ref AWS::NoValue]
                   - Fn::ImportValue: !Sub ${EnvironmentName}-AuroraSecretArn
 
   TaskRole:
@@ -433,8 +445,11 @@ Resources:
           Secrets:
             - Name: LITELLM_MASTER_KEY
               ValueFrom: !Sub "${MasterKeySecret}:LITELLM_MASTER_KEY::"
-            - Name: BEDROCK_MANTLE_API_KEY
-              ValueFrom: !Sub "${BedrockMantleApiKeySecret}:BEDROCK_MANTLE_API_KEY::"
+            - !If
+              - HasMantleApiKey
+              - Name: BEDROCK_MANTLE_API_KEY
+                ValueFrom: !Sub "${BedrockMantleApiKeySecret}:BEDROCK_MANTLE_API_KEY::"
+              - !Ref AWS::NoValue
             - Name: DB_USERNAME
               ValueFrom: !Sub
                 - "${SecretArn}:username::"
