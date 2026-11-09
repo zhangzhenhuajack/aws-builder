@@ -31,7 +31,7 @@ S3_STACK_NAME="${S3_STACK_NAME:-litellm-s3}"
 
 # ECS Configuration
 ECS_STACK_NAME="${ECS_STACK_NAME:-litellm-ecs}"
-LITELLM_IMAGE="${LITELLM_IMAGE:-docker.litellm.ai/berriai/litellm:v1.89.0}"
+LITELLM_IMAGE="${LITELLM_IMAGE:-docker.litellm.ai/berriai/litellm:v1.108.3}"
 TASK_CPU="${TASK_CPU:-2048}"
 TASK_MEMORY="${TASK_MEMORY:-4096}"
 DESIRED_COUNT="${DESIRED_COUNT:-2}"
@@ -85,6 +85,19 @@ SIDECAR_CODEBUILD_ROLE="${SIDECAR_CODEBUILD_ROLE:-${ENVIRONMENT_NAME}-sse-heartb
 
 # Bedrock Configuration
 BEDROCK_STACK_NAME="${BEDROCK_STACK_NAME:-litellm-bedrock}"
+
+# Optional bedrock-mantle path. Default: all models (Claude + GPT-5.x) use
+# bedrock-runtime with the ECS Task Role, so no API key is created or needed.
+# ENABLE_MANTLE=true creates the BEDROCK_MANTLE_API_KEY secret in the ECS stack
+# and lets upload-mantle-key store a LONG-TERM Bedrock API key (ABSK...).
+ENABLE_MANTLE="${ENABLE_MANTLE:-false}"
+
+# 方案 A (only with ENABLE_MANTLE) — lock the Bedrock API key to the Mantle VPC
+# endpoint. When RESTRICT_MANTLE_KEY=true, the bedrock stack attaches a Deny
+# policy to BEDROCK_API_KEY_IAM_USER so the key only works through the Mantle
+# interface VPC endpoint of the litellm VPC. Both must be set to take effect.
+RESTRICT_MANTLE_KEY="${RESTRICT_MANTLE_KEY:-false}"
+BEDROCK_API_KEY_IAM_USER="${BEDROCK_API_KEY_IAM_USER:-}"
 
 # Bedrock Logging & Alert Configuration
 LOGGING_STACK_NAME="${LOGGING_STACK_NAME:-litellm-bedrock-logging}"
@@ -291,8 +304,72 @@ deploy_s3() {
 #============================================================
 # Bedrock Deployment (Gateway + API Key)
 #============================================================
+
+# Parse the Bedrock Mantle region from an active (uncommented) api_base in
+# litellm_config.yaml (e.g. https://bedrock-mantle.us-east-2.api.aws/... -> us-east-2).
+mantle_region_from_config() {
+    grep -vE '^[[:space:]]*#' litellm_config.yaml 2>/dev/null \
+        | grep -oE 'bedrock-mantle\.[a-z0-9-]+\.api\.aws' \
+        | head -n1 | sed -E 's/^bedrock-mantle\.([a-z0-9-]+)\.api\.aws$/\1/'
+}
+
+# Read the Mantle VPC endpoint ID from the VPC stack outputs.
+get_mantle_vpce_id() {
+    aws cloudformation describe-stacks \
+        --stack-name "${VPC_STACK_NAME}" \
+        --region "${AWS_REGION}" \
+        --query "Stacks[0].Outputs[?OutputKey=='BedrockMantleEndpointId'].OutputValue" \
+        --output text 2>/dev/null
+}
+
+# Preflight for 方案 A. Validates region alignment + inputs, then echoes the
+# Mantle VPC endpoint ID on success. Aborts (exit 1) with guidance on failure.
+mantle_lock_resolve() {
+    local cfg_region vpce_id
+    if [[ "${ENABLE_MANTLE}" != "true" ]]; then
+        log_error "方案 A only applies to the optional mantle path. Set ENABLE_MANTLE=true first."
+        exit 1
+    fi
+    cfg_region="$(mantle_region_from_config)"
+    if [[ -z "${cfg_region}" ]]; then
+        log_error "No active bedrock-mantle api_base in litellm_config.yaml — nothing to restrict."
+        exit 1
+    fi
+    if [[ "${cfg_region}" != "${AWS_REGION}" ]]; then
+        log_error "方案 A requires the Mantle interface endpoint in the SAME region as api_base."
+        log_error "  litellm_config.yaml api_base region : ${cfg_region}"
+        log_error "  deploy region (AWS_REGION)          : ${AWS_REGION}"
+        log_error "Fix: deploy with AWS_REGION=${cfg_region}, OR change api_base in"
+        log_error "litellm_config.yaml to bedrock-mantle.${AWS_REGION}.api.aws (if GPT models are offered there)."
+        exit 1
+    fi
+    if [[ -z "${BEDROCK_API_KEY_IAM_USER}" ]]; then
+        log_error "Set BEDROCK_API_KEY_IAM_USER to the IAM user that owns the long-term Bedrock API key."
+        log_error "That is the identity whose service-specific credential is the key (not the ECS task role)."
+        exit 1
+    fi
+    vpce_id="$(get_mantle_vpce_id)"
+    if [[ -z "${vpce_id}" || "${vpce_id}" == "None" ]]; then
+        log_error "Mantle VPC endpoint not found in stack ${VPC_STACK_NAME}."
+        log_error "Deploy the VPC stack first (CreateMantleVpcEndpoint=true): ./deploy.sh deploy-vpc"
+        exit 1
+    fi
+    echo "${vpce_id}"
+}
+
 deploy_bedrock() {
     log_info "Deploying Bedrock stack: ${BEDROCK_STACK_NAME} in region: ${AWS_REGION}"
+
+    # 方案 A: resolve the VPC-lock parameters when enabled.
+    local restrict="false" api_user="" vpce_id=""
+    if [[ "${RESTRICT_MANTLE_KEY}" == "true" ]]; then
+        vpce_id="$(mantle_lock_resolve)"
+        restrict="true"
+        api_user="${BEDROCK_API_KEY_IAM_USER}"
+        log_info "API-key VPC lock (方案 A): ENABLED (user=${api_user}, vpce=${vpce_id})"
+    else
+        log_info "API-key VPC lock (方案 A): disabled (set RESTRICT_MANTLE_KEY=true to enable)"
+    fi
 
     validate_template "bedrock.yaml"
 
@@ -303,6 +380,9 @@ deploy_bedrock() {
         --capabilities CAPABILITY_NAMED_IAM \
         --parameter-overrides \
             EnvironmentName="${ENVIRONMENT_NAME}" \
+            RestrictApiKeyToVpce="${restrict}" \
+            ApiKeyIamUserName="${api_user}" \
+            MantleVpcEndpointId="${vpce_id}" \
         --tags \
             "Project=litellm" \
             "Environment=${ENVIRONMENT_NAME}" \
@@ -311,14 +391,18 @@ deploy_bedrock() {
 
     log_info "Bedrock stack deployment completed!"
     show_outputs "${BEDROCK_STACK_NAME}"
+}
 
+#============================================================
+# 方案 A — Lock the Bedrock API key to the Mantle VPC endpoint
+#============================================================
+restrict_mantle_key() {
+    log_info "方案 A: locking the Bedrock API key to the Mantle VPC endpoint."
+    RESTRICT_MANTLE_KEY="true"
+    deploy_bedrock
     echo ""
-    log_info "Bedrock API Key has been generated and stored in Secrets Manager."
-    log_info "Retrieve it with:"
-    echo "  aws secretsmanager get-secret-value \\"
-    echo "    --secret-id ${ENVIRONMENT_NAME}/litellm/bedrock-api-key \\"
-    echo "    --region ${AWS_REGION} \\"
-    echo "    --query 'SecretString' --output text | jq -r '.AWS_BEARER_TOKEN_BEDROCK'"
+    log_info "Done. The API key now only works through the VPC Mantle endpoint."
+    log_info "Verify from OUTSIDE the VPC — a bearer-token call should now return AccessDeniedException."
 }
 
 #============================================================
@@ -373,24 +457,27 @@ deploy_logging() {
 # Upload Bedrock Mantle API Key to Secrets Manager
 #============================================================
 upload_mantle_key() {
-    log_info "Uploading Bedrock Mantle API Key to Secrets Manager..."
-
-    # Optional: the Mantle key is only needed for the gpt-5.x models. Deploying
-    # the service has nothing to do with which AI client (Codex/Claude/Kiro/none)
-    # is installed locally, so a missing key must NOT abort the deploy — it just
-    # leaves the gpt models unusable (Claude/Bedrock models are unaffected).
-    # Source order: env var first (CI/anyone can pass it), then ~/.codex/.env as
-    # a convenience fallback, otherwise warn and skip.
-    local api_key="${BEDROCK_MANTLE_API_KEY:-}"
-    local env_file="${HOME}/.codex/.env"
-    if [[ -z "${api_key}" && -f "${env_file}" ]]; then
-        api_key=$(grep '^AWS_BEARER_TOKEN_BEDROCK=' "${env_file}" | cut -d'=' -f2-)
+    # Optional path. By default GPT-5.x runs on bedrock-runtime with the ECS
+    # Task Role, so there is no key to upload.
+    if [[ "${ENABLE_MANTLE}" != "true" ]]; then
+        log_info "Mantle API key: skipped (ENABLE_MANTLE=false; GPT-5.x uses the ECS Task Role on bedrock-runtime)."
+        return 0
     fi
 
+    log_info "Uploading Bedrock Mantle API Key to Secrets Manager..."
+
+    # Only an explicitly provided key is accepted. The old ~/.codex/.env
+    # fallback picked up a SHORT-TERM token (bedrock-api-key-..., valid <=12h),
+    # which expired and left the gpt models returning 401 "Signature expired".
+    local api_key="${BEDROCK_MANTLE_API_KEY:-}"
     if [[ -z "${api_key}" ]]; then
-        log_warn "No Bedrock Mantle API key found (set BEDROCK_MANTLE_API_KEY or put AWS_BEARER_TOKEN_BEDROCK in ${env_file})."
-        log_warn "Skipping — gpt-5.x models will be unavailable; Claude/Bedrock models work normally."
-        return 0
+        log_error "ENABLE_MANTLE=true but BEDROCK_MANTLE_API_KEY is not set."
+        exit 1
+    fi
+    if [[ "${api_key}" != ABSK* ]]; then
+        log_error "BEDROCK_MANTLE_API_KEY is not a long-term Bedrock API key (expected prefix ABSK)."
+        log_error "Short-term keys (bedrock-api-key-...) expire within 12h and would break the gpt models."
+        exit 1
     fi
 
     local secret_id="${ENVIRONMENT_NAME}/litellm/bedrock-mantle-api-key"
@@ -398,9 +485,9 @@ upload_mantle_key() {
     aws secretsmanager put-secret-value \
         --secret-id "${secret_id}" \
         --secret-string "{\"BEDROCK_MANTLE_API_KEY\":\"${api_key}\"}" \
-        --region "${AWS_REGION}" 2>/dev/null && \
-        log_info "Bedrock Mantle API Key updated in Secrets Manager." || \
-        log_warn "Secret ${secret_id} not found yet. It will be created during deploy-ecs."
+        --region "${AWS_REGION}" > /dev/null 2>&1 && \
+        log_info "Bedrock Mantle API Key updated in Secrets Manager (restart ECS tasks to pick it up)." || \
+        log_warn "Secret ${secret_id} not found. Run 'ENABLE_MANTLE=true ./deploy.sh deploy-ecs' first."
 }
 
 #============================================================
@@ -657,6 +744,7 @@ deploy_ecs() {
             SidecarImage="${SIDECAR_IMAGE}" \
             HeartbeatInterval="${HEARTBEAT_INTERVAL}" \
             CpuArchitecture="${CFN_CPU_ARCH}" \
+            EnableMantleApiKey="${ENABLE_MANTLE}" \
         --tags \
             "Project=litellm" \
             "Environment=${ENVIRONMENT_NAME}" \
@@ -790,6 +878,8 @@ usage() {
     echo "  deploy-s3     Deploy the S3 stack"
     echo "  deploy-ecs    Deploy the ECS stack (Fargate + ALB)"
     echo "  deploy-logging Deploy Bedrock Model Invocation Logging -> CloudWatch + spike alarm"
+    echo "  restrict-mantle-key  Lock the Bedrock API key to the Mantle VPC endpoint (方案 A, optional mantle path)"
+    echo "  upload-mantle-key    Store a long-term Bedrock API key (only with ENABLE_MANTLE=true)"
     echo "  deploy-guardduty Enable GuardDuty anomalous API detection + findings alert (script)"
     echo "  deploy-anomaly Add Bedrock anomaly-detection alarms + cost anomaly detection (script)"
     echo "  deploy-all    Deploy all stacks in order (default)"
@@ -809,6 +899,15 @@ usage() {
     echo "Environment Variables:"
     echo "  ENVIRONMENT_NAME       Environment prefix (default: litellm)"
     echo "  AWS_REGION             AWS region (default: us-east-1)"
+    echo ""
+    echo "  Optional bedrock-mantle path (default off; GPT-5.x uses the ECS Task Role):"
+    echo "  ENABLE_MANTLE             true to create/inject the BEDROCK_MANTLE_API_KEY secret (default: false)"
+    echo "  BEDROCK_MANTLE_API_KEY    LONG-TERM Bedrock API key (ABSK...), used by upload-mantle-key"
+    echo ""
+    echo "  方案 A — API key VPC lock (restrict-mantle-key, requires ENABLE_MANTLE=true):"
+    echo "  RESTRICT_MANTLE_KEY       true to lock the API key to the Mantle VPCE (default: false)"
+    echo "  BEDROCK_API_KEY_IAM_USER  IAM user that owns the long-term Bedrock API key (required when locking)"
+    echo "  NOTE: the api_base region in litellm_config.yaml must equal AWS_REGION for the lock to work."
     echo ""
     echo "  VPC:"
     echo "  VPC_STACK_NAME         VPC stack name (default: litellm-vpc)"
@@ -858,6 +957,10 @@ main() {
         deploy-bedrock)
             check_prerequisites
             deploy_bedrock
+            ;;
+        restrict-mantle-key|lock-mantle-key)
+            check_prerequisites
+            restrict_mantle_key
             ;;
         deploy-logging)
             check_prerequisites
